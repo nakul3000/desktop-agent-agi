@@ -4,6 +4,8 @@ import os
 from dotenv import load_dotenv
 from linkup import LinkupClient
 
+import memory
+
 load_dotenv()
 
 
@@ -34,11 +36,39 @@ class ResultFormatter:
 
 
 class LinkupJobSearch:
-    def __init__(self):
+    def __init__(self, session_id: str | None = None, user_id: str | None = None):
         api_key = os.getenv("LINKUP_API_KEY")
         if not api_key:
             raise ValueError("LINKUP_API_KEY not found in .env")
+
+        memory.init_db()
+        self.user_id = user_id or os.getenv("USER_ID") or "anonymous"
+        memory.register_user(self.user_id)
+        self.session_id = session_id or memory.start_session(user_id=self.user_id)
         self.client = LinkupClient(api_key=api_key)
+
+    # --- memory helpers ---
+    def _log_turn(self, role: str, text: str) -> int:
+        return memory.store_turn(self.session_id, role=role, text=text)
+
+    def _log_artifact(self, type: str, content, source_turn_id=None, created_by="LinkupJobSearch"):
+        return memory.store_artifact(
+            session_id=self.session_id,
+            type=type,
+            content=content,
+            source_turn_id=source_turn_id,
+            created_by=created_by,
+        )
+
+    def _log_fact(self, kind: str, key: str, value: str, meta=None, confidence: float = 0.8):
+        return memory.store_fact(
+            session_id=self.session_id,
+            kind=kind,
+            key=key,
+            value=value,
+            meta=meta or {},
+            confidence=confidence,
+        )
 
     def search_jobs(self, role: str, company: str = None, location: str = None) -> dict:
         """Search for job openings using Linkup."""
@@ -49,6 +79,8 @@ class LinkupJobSearch:
             query_parts.append(location)
         query = " ".join(query_parts)
 
+        user_turn = self._log_turn("user", f"Search jobs query: {query}")
+
         print(f"🔍 Searching jobs: {query}")
         response = self.client.search(
             query=query,
@@ -56,12 +88,36 @@ class LinkupJobSearch:
             output_type="searchResults",
             include_images=False,
         )
+
+        self._log_turn("assistant", f"Linkup returned {len(getattr(response, 'results', []) or [])} results for '{query}'")
+        artifact_id = self._log_artifact(
+            type="linkup_research",
+            content={"query": query, "location": location, "company": company},
+            source_turn_id=user_turn,
+        )
+        if company:
+            self._log_fact(
+                kind="preference",
+                key="target_company",
+                value=company,
+                meta={"source_artifact_id": artifact_id, "title": f"Target company {company}"},
+                confidence=0.9,
+            )
+        if role:
+            self._log_fact(
+                kind="preference",
+                key="target_role",
+                value=role,
+                meta={"source_artifact_id": artifact_id, "title": f"Target role {role}"},
+                confidence=0.85,
+            )
         return response
 
     def get_company_profile(self, company: str) -> dict:
         """Research company background, funding, culture, tech stack."""
         query = f"{company} company overview funding tech stack culture engineering team 2025"
 
+        self._log_turn("user", f"Research company profile: {company}")
         print(f"🏢 Researching company: {company}")
         response = self.client.search(
             query=query,
@@ -69,12 +125,25 @@ class LinkupJobSearch:
             output_type="searchResults",
             include_images=False,
         )
+
+        artifact_id = self._log_artifact(
+            type="company_research",
+            content={"query": query, "company": company},
+        )
+        self._log_fact(
+            kind="company",
+            key="company_name",
+            value=company,
+            meta={"source_artifact_id": artifact_id, "title": f"Company research for {company}"},
+            confidence=0.75,
+        )
         return response
 
     def get_company_sentiment(self, company: str) -> dict:
         """Get employee reviews and sentiment analysis."""
         query = f"{company} employee reviews glassdoor engineering culture work life balance"
 
+        self._log_turn("user", f"Analyze sentiment for {company}")
         print(f"💬 Analyzing sentiment: {company}")
         response = self.client.search(
             query=query,
@@ -82,18 +151,29 @@ class LinkupJobSearch:
             output_type="searchResults",
             include_images=False,
         )
+
+        self._log_artifact(
+            type="company_sentiment",
+            content={"query": query, "company": company},
+        )
         return response
 
     def find_recruiters(self, company: str, role: str) -> dict:
         """Find recruiters and hiring managers."""
         query = f"{company} recruiter hiring manager {role} LinkedIn"
 
+        self._log_turn("user", f"Find recruiters for {company} - {role}")
         print(f"👤 Finding recruiters: {company} - {role}")
         response = self.client.search(
             query=query,
             depth="standard",
             output_type="searchResults",
             include_images=False,
+        )
+
+        self._log_artifact(
+            type="recruiter_profile",
+            content={"query": query, "company": company, "role": role},
         )
         return response
 
