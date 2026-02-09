@@ -13,8 +13,9 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import sqlite3
+import uuid
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Iterable, Dict, Any
 
 DEFAULT_DB_PATH = Path("memory.db")
 
@@ -43,12 +44,40 @@ def _create_tables(conn: sqlite3.Connection) -> None:
     """Create all tables defined for the memory system if they are missing."""
     cur = conn.cursor()
 
+    # Users table for mapping user identity
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT UNIQUE NOT NULL,
+            name TEXT,
+            email TEXT,
+            meta_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+
+    # Sessions table to tie session_id to a user
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT UNIQUE NOT NULL,
+            user_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS turns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
+            user_id TEXT,
             role TEXT NOT NULL,
+            tool_name TEXT,
             text TEXT NOT NULL,
             timestamp TEXT NOT NULL
         );
@@ -60,6 +89,7 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
+            user_id TEXT,
             type TEXT NOT NULL,
             content TEXT NOT NULL,
             source_turn_id INTEGER,
@@ -74,6 +104,7 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
+            user_id TEXT,
             kind TEXT NOT NULL,
             key TEXT NOT NULL,
             value TEXT NOT NULL,
@@ -90,6 +121,7 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS refs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
+            user_id TEXT,
             phrase TEXT NOT NULL,
             resolved_type TEXT NOT NULL,
             resolved_id INTEGER NOT NULL,
@@ -104,6 +136,7 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS embeddings_map (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
+            user_id TEXT,
             item_type TEXT NOT NULL,
             item_id INTEGER NOT NULL,
             text_for_embedding TEXT NOT NULL,
@@ -113,6 +146,18 @@ def _create_tables(conn: sqlite3.Connection) -> None:
     )
 
     conn.commit()
+
+    # Backfill helper: add user_id column if table pre-exists without it
+    def _ensure_column(table: str, column: str, col_type: str) -> None:
+        cur.execute(f"PRAGMA table_info({table});")
+        cols = [row[1] for row in cur.fetchall()]
+        if column not in cols:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type};")
+
+    for tbl in ("turns", "artifacts", "facts", "refs", "embeddings_map"):
+        _ensure_column(tbl, "user_id", "TEXT")
+    # Ensure tool_name exists on turns
+    _ensure_column("turns", "tool_name", "TEXT")
 
 
 def init_db(db_path: Optional[str | Path] = None) -> None:
@@ -125,9 +170,58 @@ def init_db(db_path: Optional[str | Path] = None) -> None:
         _create_tables(conn)
 
 
+# --- User and session helpers --------------------------------------------- #
+
+def register_user(user_id: str, name: Optional[str] = None, email: Optional[str] = None, meta: Optional[dict] = None, db_path: Optional[Union[str, Path]] = None) -> int:
+    """
+    Insert or ignore a user record. Returns the row id (existing or new).
+    """
+    created_at = utc_now_iso()
+    meta_json = json.dumps(meta or {}, ensure_ascii=False)
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO users (user_id, name, email, meta_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, name, email, meta_json, created_at),
+        )
+        # fetch id
+        cur.execute("SELECT id FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        return int(row["id"]) if row else -1
+
+
+def start_session(user_id: Optional[str] = None, session_id: Optional[str] = None, db_path: Optional[Union[str, Path]] = None) -> str:
+    """
+    Create a new session row and return the session_id. If session_id is not provided,
+    a UUID4 string is generated. User_id is optional.
+    """
+    sid = session_id or str(uuid.uuid4())
+    created_at = utc_now_iso()
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO sessions (session_id, user_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (sid, user_id, created_at),
+        )
+    return sid
+
+
 # --- Basic inserts --------------------------------------------------------- #
 
-def store_turn(session_id: str, role: str, text: str, db_path: Optional[Union[str, Path]] = None) -> int:
+def store_turn(
+    session_id: str,
+    role: str,
+    text: str,
+    user_id: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    db_path: Optional[Union[str, Path]] = None,
+) -> int:
     """Insert a conversation turn and return its id. Raises RuntimeError on failure."""
     timestamp = utc_now_iso()
     try:
@@ -135,10 +229,10 @@ def store_turn(session_id: str, role: str, text: str, db_path: Optional[Union[st
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO turns (session_id, role, text, timestamp)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO turns (session_id, user_id, role, tool_name, text, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, role, text, timestamp),
+                (session_id, user_id, role, tool_name, text, timestamp),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -158,6 +252,7 @@ def store_artifact(
     content: Union[str, dict],
     source_turn_id: Optional[int] = None,
     created_by: Optional[str] = None,
+    user_id: Optional[str] = None,
     db_path: Optional[Union[str, Path]] = None,
 ) -> int:
     """Insert an artifact row and return its id. Raises RuntimeError on failure."""
@@ -168,10 +263,10 @@ def store_artifact(
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO artifacts (session_id, type, content, source_turn_id, created_by, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO artifacts (session_id, user_id, type, content, source_turn_id, created_by, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, type, content_str, source_turn_id, created_by, timestamp),
+                (session_id, user_id, type, content_str, source_turn_id, created_by, timestamp),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -187,6 +282,7 @@ def store_fact(
     source_artifact_id: Optional[int] = None,
     confidence: float = 0.8,
     meta: Optional[dict] = None,
+    user_id: Optional[str] = None,
     db_path: Optional[Union[str, Path]] = None,
 ) -> int:
     """Insert a fact row and return its id. Raises RuntimeError on failure."""
@@ -197,10 +293,10 @@ def store_fact(
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO facts (session_id, kind, key, value, meta_json, source_artifact_id, confidence, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO facts (session_id, user_id, kind, key, value, meta_json, source_artifact_id, confidence, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, kind, key, value, meta_json, source_artifact_id, confidence, timestamp),
+                (session_id, user_id, kind, key, value, meta_json, source_artifact_id, confidence, timestamp),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -268,6 +364,57 @@ def search_facts_by_key(session_id: str, key_pattern: str, db_path: Optional[Uni
         return cur.fetchall()
 
 
+# --- Context assembly ------------------------------------------------------ #
+
+def _rows_to_dict(rows: Iterable[sqlite3.Row], fields: Optional[Iterable[str]] = None) -> list[Dict[str, Any]]:
+    out = []
+    for row in rows:
+        d = dict(row)
+        if fields:
+            d = {k: d[k] for k in fields if k in d}
+        out.append(d)
+    return out
+
+
+def get_context(
+    session_id: str,
+    user_id: Optional[str] = None,
+    k_recent_turns: int = 6,
+    k_recent_artifacts: int = 6,
+    k_recent_facts: int = 10,
+    db_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """
+    Gather recent turns, artifacts, and facts for a session (optionally filtered by user_id).
+    Designed to feed into a generator prompt.
+    """
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+
+        def _fetch(table: str, limit: int) -> list[sqlite3.Row]:
+            query = f"SELECT * FROM {table} WHERE session_id = ?"
+            params: list[Any] = [session_id]
+            if user_id:
+                query += " AND (user_id IS NULL OR user_id = ?)"
+                params.append(user_id)
+            query += " ORDER BY timestamp DESC"
+            if limit:
+                query += " LIMIT ?"
+                params.append(limit)
+            cur.execute(query, params)
+            return cur.fetchall()
+
+        turns = _fetch("turns", k_recent_turns)
+        artifacts = _fetch("artifacts", k_recent_artifacts)
+        facts = _fetch("facts", k_recent_facts)
+
+    return {
+        "recent_turns": _rows_to_dict(turns),
+        "recent_artifacts": _rows_to_dict(artifacts),
+        "recent_facts": _rows_to_dict(facts),
+    }
+
+
 __all__ = [
     "DEFAULT_DB_PATH",
     "get_connection",
@@ -280,4 +427,7 @@ __all__ = [
     "get_artifacts_by_session",
     "get_facts_by_session",
     "search_facts_by_key",
+    "get_context",
+    "register_user",
+    "start_session",
 ]
