@@ -149,6 +149,84 @@ def _extract_contact_fields(text: str) -> Tuple[Dict[str, Any], Dict[str, float]
     }
     return contact, confidence
 
+SECTION_ALIASES = {
+    "objective": ["objective", "summary", "professional summary"],
+    "education": ["education", "academics"],
+    "experience": ["work experience", "experience", "employment"],
+    "volunteer_experience": ["volunteer experience", "volunteering"],
+    "projects": ["projects", "project experience"],
+    "skills": ["skills", "technical skills", "core skills"],
+    "activities": ["activities", "extracurricular", "achievements", "honors", "honors and activities"],
+}
+
+def _normalize_heading(s: str) -> str:
+    s = _clean_line(s).lower()
+    # remove punctuation-like noise
+    s = re.sub(r"[^\w\s]", "", s)
+    return s.strip()
+
+def _is_heading_line(line: str) -> bool:
+    """
+    Detect resume section headings.
+    Heuristic: mostly uppercase, short, and not containing email/phone/url.
+    """
+    ln = _clean_line(line)
+    if not ln:
+        return False
+    if EMAIL_RE.search(ln) or PHONE_RE.search(ln) or URL_RE.search(ln):
+        return False
+    # too long to be heading
+    if len(ln) > 45:
+        return False
+    # uppercase ratio heuristic
+    letters = [c for c in ln if c.isalpha()]
+    if not letters:
+        return False
+    upper = sum(1 for c in letters if c.isupper())
+    ratio = upper / max(1, len(letters))
+    return ratio >= 0.75
+
+def _map_heading_to_section(heading: str) -> Optional[str]:
+    h = _normalize_heading(heading)
+    for section, aliases in SECTION_ALIASES.items():
+        for a in aliases:
+            if a in h:
+                return section
+    return None
+
+def split_resume_sections(text: str) -> Dict[str, str]:
+    """
+    Split resume into sections keyed by canonical section names.
+    Returns a dict: section_name -> section_text
+    """
+    lines = [ln for ln in text.splitlines()]
+    current_section = "header"
+    buckets: Dict[str, list[str]] = {"header": []}
+
+    for raw in lines:
+        ln = _clean_line(raw)
+        if not ln:
+            continue
+
+        if _is_heading_line(ln):
+            mapped = _map_heading_to_section(ln)
+            if mapped:
+                current_section = mapped
+                buckets.setdefault(current_section, [])
+                continue
+
+        buckets.setdefault(current_section, [])
+        buckets[current_section].append(ln)
+
+    # join buckets into text blocks
+    out: Dict[str, str] = {}
+    for k, v in buckets.items():
+        block = "\n".join(v).strip()
+        if block:
+            out[k] = block
+    return out
+
+
 
 def process_resume(document_path: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
@@ -185,6 +263,7 @@ def process_resume(document_path: str, context: Optional[Dict[str, Any]] = None)
     preview = extracted.get("preview", "")
 
     contact, contact_conf = _extract_contact_fields(text)
+    sections = split_resume_sections(text)
 
     if text_len < 200:
         note = "Very little text extracted. Resume may be image-based; OCR fallback not enabled yet."
@@ -208,6 +287,7 @@ def process_resume(document_path: str, context: Optional[Dict[str, Any]] = None)
             "contact": contact,
             # Keep full text for next steps (sectioning, experience extraction, etc.)
             "text": text,
+            "sections": sections,
         },
         "confidence": confidence,
         "citations": [],
