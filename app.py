@@ -8,6 +8,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 
+import memory
+
 load_dotenv()
 
 # ------------------------------------------------------------------ #
@@ -292,6 +294,13 @@ class JobAgent:
             "content": SYSTEM_PROMPT,
         })
 
+        # Initialize memory
+        self.session_id = os.getenv("SESSION_ID") or "default"
+        self.user_id = os.getenv("USER_ID") or "anonymous"
+        memory.init_db()
+        memory.register_user(self.user_id)
+        memory.start_session(user_id=self.user_id, session_id=self.session_id)
+
         # Store context from tool results for downstream use
         self.context_store = {
             "last_jobs": None,
@@ -308,6 +317,7 @@ class JobAgent:
             "role": "user",
             "content": user_message,
         })
+        memory.store_turn(self.session_id, role="user", text=user_message, user_id=self.user_id)
 
         # Get LLM response
         response = self._call_llm()
@@ -326,10 +336,21 @@ class JobAgent:
 
             # Execute the tool
             if tool_name in TOOL_EXECUTORS:
+                memory.store_turn(self.session_id, role="assistant", text=f"[Tool call planned] {tool_name} {params}", user_id=self.user_id)
                 tool_result = TOOL_EXECUTORS[tool_name](params)
+                tool_turn_id = memory.store_turn(self.session_id, role="tool", text=str(tool_result), user_id=self.user_id, tool_name=tool_name)
 
                 # Store context
                 self._update_context(tool_name, tool_result)
+                # Persist artifact
+                memory.store_artifact(
+                    session_id=self.session_id,
+                    type=tool_name,
+                    content=tool_result,
+                    source_turn_id=tool_turn_id,
+                    created_by="JobAgent",
+                    user_id=self.user_id,
+                )
 
                 # Add tool call + result to conversation history
                 self.conversation_history.append({
@@ -348,6 +369,7 @@ class JobAgent:
                     "role": "assistant",
                     "content": summary,
                 })
+                memory.store_turn(self.session_id, role="assistant", text=summary, user_id=self.user_id)
 
                 return summary
             else:
@@ -356,6 +378,7 @@ class JobAgent:
                     "role": "assistant",
                     "content": error_msg,
                 })
+                memory.store_turn(self.session_id, role="assistant", text=error_msg, user_id=self.user_id)
                 return error_msg
         else:
             # No tool call — natural language response
@@ -363,13 +386,21 @@ class JobAgent:
                 "role": "assistant",
                 "content": response,
             })
+            memory.store_turn(self.session_id, role="assistant", text=response, user_id=self.user_id)
             return response
 
     def _call_llm(self) -> str:
         """Call the HuggingFace Llama model."""
         try:
+            ctx = memory.get_context(self.session_id, user_id=self.user_id)
+            messages = self.conversation_history + [
+                {
+                    "role": "system",
+                    "content": f"Context packet (recent turns/artifacts/facts): {json.dumps(ctx)[:4000]}"
+                }
+            ]
             response = self.client.chat_completion(
-                messages=self.conversation_history,
+                messages=messages,
                 max_tokens=1024,
                 temperature=0.7,
                 top_p=0.9,

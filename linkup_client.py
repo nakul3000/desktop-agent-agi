@@ -8,29 +8,12 @@ from company_research_agent import CompanyResearchAgent, JobPostingIntake
 
 load_dotenv()
 
-_DB_INITIALIZED = False
-
-
-def _ensure_db_initialized() -> None:
-    global _DB_INITIALIZED
-    if _DB_INITIALIZED:
-        return
-    memory.init_db()
-    _DB_INITIALIZED = True
-
 
 class LinkupJobSearch:
     def __init__(self, session_id: str | None = None, user_id: str | None = None):
         api_key = os.getenv("LINKUP_API_KEY")
         if not api_key:
             raise ValueError("LINKUP_API_KEY not found in .env")
-
-        _ensure_db_initialized()
-        self.user_id = user_id or os.getenv("USER_ID") or "anonymous"
-        memory.register_user(self.user_id)
-        # Reuse a stable session if provided; otherwise default to env or "default"
-        self.session_id = session_id or os.getenv("SESSION_ID") or "default"
-        memory.start_session(user_id=self.user_id, session_id=self.session_id)
         self.client = LinkupClient(api_key=api_key)
         self.company_research_agent = CompanyResearchAgent(self.client)
 
