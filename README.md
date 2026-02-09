@@ -1,5 +1,6 @@
 # desktop-agent-agi
 A repo for hack with DC desktop personal agent.
+This project builds a local-first desktop agent that can search, summarize, and orchestrate tools while keeping a privacy-friendly memory (SQLite) of conversations, artifacts, and facts for better follow-ups.
 
 ## Packaging notes
 - This repo currently ships without a `pyproject.toml` or `setup.py`. Use `requirements.txt` for dependencies or add your own packaging config if you need installs.
@@ -37,4 +38,3 @@ A repo for hack with DC desktop personal agent.
   3) `artifact_id = memory.store_artifact(session, "doc_summary", {"title": "...", "content": "..."})`
   4) `fact_id = memory.store_fact(session, "deadline", "response_deadline", "2026-02-15", meta={"title": "Respond to ..."})`
   5) If embeddings installed, create `EmbeddingIndex` and add text using `prepare_text_for_embedding(content)`.
-
