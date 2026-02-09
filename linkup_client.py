@@ -94,43 +94,12 @@ Return all qualifying job links and details. Prioritize official {company_name} 
             output_type="searchResults",
             include_images=False,
         )
-
-        self._log_turn("assistant", f"Linkup returned {len(getattr(response, 'results', []) or [])} results for '{query}'")
-        artifact_id = self._log_artifact(
-            type="linkup_research",
-            content={
-                "query": query,
-                "location": location,
-                "company": company,
-                "results": self._results_to_storeable(response),
-            },
-            source_turn_id=user_turn,
-        )
-        if company:
-            self._log_fact(
-                kind="preference",
-                key="target_company",
-                value=company,
-                meta={"source_artifact_id": artifact_id, "title": f"Target company {company}"},
-                source_artifact_id=artifact_id,
-                confidence=0.9,
-            )
-        if role:
-            self._log_fact(
-                kind="preference",
-                key="target_role",
-                value=role,
-                meta={"source_artifact_id": artifact_id, "title": f"Target role {role}"},
-                source_artifact_id=artifact_id,
-                confidence=0.85,
-            )
         return response
 
     def get_company_profile(self, company: str, query: str | None = None) -> dict:
         """Research company background, funding, culture, tech stack."""
         query = query or f"{company} company overview funding tech stack culture engineering team 2025"
 
-        self._log_turn("user", f"Research company profile: {company}")
         print(f"🏢 Researching company: {company}")
         response = self.client.search(
             query=query,
@@ -138,36 +107,18 @@ Return all qualifying job links and details. Prioritize official {company_name} 
             output_type="searchResults",
             include_images=False,
         )
-
-        artifact_id = self._log_artifact(
-            type="company_research",
-            content={"query": query, "company": company, "results": self._results_to_storeable(response)},
-        )
-        self._log_fact(
-            kind="company",
-            key="company_name",
-            value=company,
-            meta={"source_artifact_id": artifact_id, "title": f"Company research for {company}"},
-            confidence=0.75,
-        )
         return self.company_research_agent.research_profile(company)
 
     def get_company_sentiment(self, company: str, query: str | None = None) -> dict:
         """Get employee reviews and sentiment analysis."""
         query = query or f"{company} employee reviews glassdoor engineering culture work life balance"
 
-        self._log_turn("user", f"Analyze sentiment for {company}")
         print(f"💬 Analyzing sentiment: {company}")
         response = self.client.search(
             query=query,
             depth="standard",
             output_type="searchResults",
             include_images=False,
-        )
-
-        self._log_artifact(
-            type="company_sentiment",
-            content={"query": query, "company": company, "results": self._results_to_storeable(response)},
         )
         # Return sentiment analysis report from the dedicated agent
         return self.company_research_agent.research_sentiment(company)
@@ -176,18 +127,12 @@ Return all qualifying job links and details. Prioritize official {company_name} 
         """Find recruiters and hiring managers."""
         query = query or f"{company} recruiter hiring manager {role} LinkedIn"
 
-        self._log_turn("user", f"Find recruiters for {company} - {role}")
         print(f"👤 Finding recruiters: {company} - {role}")
         response = self.client.search(
             query=query,
             depth="standard",
             output_type="searchResults",
             include_images=False,
-        )
-
-        self._log_artifact(
-            type="recruiter_profile",
-            content={"query": query, "company": company, "role": role, "results": self._results_to_storeable(response)},
         )
         return response
 
