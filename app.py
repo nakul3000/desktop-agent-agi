@@ -1,15 +1,16 @@
 # Entry point for the personalized agent app
+import os
 from agent_core import AgentCore
 from linkup_client import LinkupClient
-from memory import Memory
+import memory
 from email_handler import EmailHandler
 from document_handler import DocumentHandler
 from calendar_handler import CalendarHandler
 
 # Load config and initialize components (placeholders)
-linkup_client = LinkupClient(api_key='YOUR_LINKUP_API_KEY')
-memory = Memory()
-email_handler = EmailHandler()
+memory.init_db()
+linkup_client = LinkupClient(api_key=os.getenv("LINKUP_API_KEY"))
+email_handler = EmailHandler(hf_token=os.getenv("HF_TOKEN"), auto_authenticate_gmail=False)
 document_handler = DocumentHandler()
 calendar_handler = CalendarHandler()
 
