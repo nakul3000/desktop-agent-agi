@@ -1,0 +1,123 @@
+
+Twenty
+Share
+Show more options
+Applied AI Engineer
+Washington, DC · Reposted 2 weeks ago · Over 100 people clicked apply
+Promoted by hirer · Responses managed off LinkedIn
+
+
+ On-site
+Matches your job preferences, workplace type is On-site.
+
+ Full-time
+Matches your job preferences, job type is Full-time.
+
+Apply
+
+Save
+Save Applied AI Engineer at Twenty
+How your profile and resume fit this job
+Get AI-powered advice on this job and more exclusive features with Premium. Reactivate Premium: 50% Off
+
+
+Show match details
+
+Tailor my resume
+
+Help me stand out
+About the job
+About The Company
+
+At Twenty, we're taking on one of the most critical challenges of our time: defending democracies in the digital age. We develop revolutionary technologies that operate at the intersection of the cyber and electromagnetic domains, where the speed of operations exceeds human sensing and complexity transcends conventional boundaries. Our team doesn't just solve problems – we deliver game-changing outcomes that directly impact national security. We're pragmatic optimists who understand that while our mission of protecting America and its allies is challenging, success is possible.
+
+Role Summary
+
+You’ll build and ship language-model-powered systems that strengthen Twenty’s mission-critical cyber capabilities for U.S. national security. You’ll own the end-to-end workflow—from curating specialized datasets and post-training models to deploying reliable inference and retrieval systems in production. You’ll partner closely with product and engineering to translate real operational needs into high-performing AI features, operating across cloud and on-premises environments where speed, correctness, and security matter.
+
+Who You Are
+
+You’re motivated by real-world outcomes and want your work to directly impact national security missions.
+You care about rigor: clean data, measurable evaluation, and repeatable experiments beat demos.
+You balance research curiosity with product instincts—you ship, observe, iterate, and harden.
+You’re comfortable working across cloud and on-premises constraints and adapting to the environment.
+You communicate clearly with engineers and non-ML partners, and you write documentation people use.
+You think in systems: models, retrieval, infrastructure, and feedback loops all have to work together.
+You thrive in fast-moving teams with high standards, direct feedback, and high ownership.
+
+What You’ll Do
+
+Create, clean, and maintain high-quality training and evaluation datasets for specialized AI use cases.
+Fine-tune language models (small specialized through medium foundation models) for mission needs.
+Implement post-training and alignment approaches to improve task performance and reliability.
+Build retrieval-augmented generation (RAG) systems that ground model outputs in external knowledge.
+Develop and optimize model serving infrastructure for production deployments.
+Design evaluation frameworks and test harnesses to measure quality, latency, and regressions.
+Integrate AI capabilities into applications and workflows using modern orchestration frameworks.
+Collaborate with cross-functional partners to identify high-leverage use cases and deliver solutions.
+Produce clear technical documentation for models, datasets, and operational processes.
+
+Must Have
+
+You have 4+ years of professional software development experience building and supporting ML/AI-enabled applications.
+You have strong Python skills and deep learning experience with PyTorch, TensorFlow, or JAX.
+You have hands-on experience with LLM post-training methods (e.g., continued pre-training, SFT, RLHF, DPO, PPO, GRPO).
+You have experience curating, cleaning, and preprocessing datasets for training and evaluation.
+You have working knowledge of relational, graph, and vector database concepts.
+You have experience designing or using evaluation metrics and testing procedures for LLMs and agents.
+You have experience integrating LLM/agent systems using frameworks like Pydantic-AI, LangChain/LangGraph, or CrewAI.
+You have a Bachelor’s degree in Computer Science, Software Engineering, or a related field (or equivalent practical experience).
+
+Nice To Have
+
+You have deployed models to production and supported them through real-world usage and incidents.
+You have experience with distributed training systems and performance debugging at scale.
+You have implemented quantization or other optimization techniques to improve inference efficiency.
+You have strong prompt engineering and model alignment instincts for reliability and control.
+You have experience building MLOps/LLMOps/AgentOps practices (versioning, rollout, monitoring).
+
+Tech Environment (You Might Work With)
+
+Deep learning stacks: PyTorch, TensorFlow, JAX
+LLMOps and serving: vLLM, TensorRT, ONNX
+Retrieval and storage: pgvector, ChromaDB, Pinecone, Milvus, Weaviate; relational/graph databases
+Orchestration: Pydantic-AI, LangChain/LangGraph, CrewAI
+Infra: Docker, Kubernetes; cloud platforms (AWS, GCP, Azure)
+Experiment and artifact tracking: dataset/prompt/model versioning
+
+Security / Work Environment
+
+Must be eligible to obtain and maintain a U.S. Government security clearance.
+
+If this role sounds like you, apply and share with us your interest.
+
+Some positions may require eligibility to obtain a U.S. Government security clearance. Any clearance requirement will be listed in the role description.
+
+Twenty is an equal opportunity employer. We consider all qualified applicants without regard to race, color, religion, sex, sexual orientation, gender identity, national origin, age, veteran status, disability, or any other protected status.
+
+If you need a reasonable accommodation during the hiring process, let us know and we will work with you.
+
+
+Job search faster with Premium
+Access company insights like strategic priorities, headcount trends, and more
+
+
+
+
+Michael and millions of other members use Premium
+
+Reactivate Premium: 50% Off
+Cancel anytime. No hidden fees.
+
+About the company
+Twenty company logo
+Twenty
+5,421 followers
+
+Follow
+Computer and Network Security  11-50 employees  23 on LinkedIn
+We apply world-class software engineering to a warfighting domain of persistent conflict. Our mission is to deliver industrial-scale cyber capabilities, ensuring the U.S. and its allies are able to deter and defeat their adversaries.
+
+At Twenty, we own the mission end to end, from rapid R&D to operational deployment. We’re looking for the rare builders who thrive under pressure, move fast, and create revolutionary capabilities that change how nations project industrial-scale power in cyberspace.
+
+Backed by the top defense tech investors in the business, including Caffeinated Capital, General Catalyst, and In-Q-Tel, we are the top 0.1% of cyber operators and proven builders building 100X cyber capabilities for the United States of America.

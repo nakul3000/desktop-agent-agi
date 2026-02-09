@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 from linkup import LinkupClient
 
-from company_research_agent import CompanyResearchAgent
+from company_research_agent import CompanyResearchAgent, JobPostingIntake
 
 load_dotenv()
 
@@ -42,6 +42,35 @@ class LinkupJobSearch:
             raise ValueError("LINKUP_API_KEY not found in .env")
         self.client = LinkupClient(api_key=api_key)
         self.company_research_agent = CompanyResearchAgent(self.client)
+
+    def build_job_intake(self, selected_jd_payload: dict) -> JobPostingIntake:
+        """
+        Normalize the "user selected one JD" payload into a stable intake object.
+
+        Expected shape (example):
+          { "answer": "...", "sources": [ { "url": "...", "snippet": "...", ... } ] }
+        """
+        return JobPostingIntake.from_selected_jd_payload(selected_jd_payload)
+
+    def research_from_selected_jd(self, selected_jd_payload: dict) -> dict:
+        """
+        Convenience method: build the intake and run company research using it as context.
+        Missing fields remain literal "NA" (no re-search / enrichment).
+        """
+        intake = self.build_job_intake(selected_jd_payload)
+
+        company = intake.company_name if intake.company_name != "NA" else "NA"
+        role = None if intake.role_title == "NA" else intake.role_title
+        job_url = None if intake.job_url == "NA" else intake.job_url
+        job_description = None if intake.answer == "NA" else intake.answer
+
+        return self.company_research_agent.research_company(
+            company=company,
+            role=role,
+            job_url=job_url,
+            job_description=job_description,
+            job_intake=intake,
+        )
 
     def search_jobs(self, role: str, company: str = None, location: str = None) -> dict:
         """Search for job openings using Linkup."""
@@ -101,14 +130,6 @@ class LinkupJobSearch:
         print(f"\n{'='*80}")
         print("✅ Research Complete!")
         print(f"{'='*80}")
-        for key, value in results.items():
-            if hasattr(value, 'results'):
-                print(f"  📄 {key}: {len(value.results)} results found")
-            else:
-                print(f"  📄 {key}: {type(value).__name__}")
-
-        return results
-        print(f"{'='*60}")
         for key, value in results.items():
             if hasattr(value, 'results'):
                 print(f"  📄 {key}: {len(value.results)} results found")
