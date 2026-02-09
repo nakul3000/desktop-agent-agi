@@ -11,6 +11,17 @@ from huggingface_hub import InferenceClient
 
 import memory
 
+# One-time DB init guard
+_DB_INITIALIZED = False
+
+
+def _ensure_db_initialized():
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    memory.init_db()
+    _DB_INITIALIZED = True
+
 load_dotenv()
 
 # ------------------------------------------------------------------ #
@@ -296,10 +307,10 @@ class JobAgent:
         })
 
         # Initialize memory
-        # Derive user/session IDs: prefer explicit args, then env, then fallbacks
+        # Derive user/session IDs: prefer explicit args then fallbacks
         self.user_id = user_id or "anonymous"
         self.session_id = session_id or str(uuid.uuid4())
-        memory.init_db()
+        _ensure_db_initialized()
         memory.register_user(self.user_id)
         memory.start_session(user_id=self.user_id, session_id=self.session_id)
 
