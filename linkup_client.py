@@ -4,6 +4,8 @@ import os
 from dotenv import load_dotenv
 from linkup import LinkupClient
 
+from company_research_agent import CompanyResearchAgent
+
 load_dotenv()
 
 
@@ -39,6 +41,7 @@ class LinkupJobSearch:
         if not api_key:
             raise ValueError("LINKUP_API_KEY not found in .env")
         self.client = LinkupClient(api_key=api_key)
+        self.company_research_agent = CompanyResearchAgent(self.client)
 
     def search_jobs(self, role: str, company: str = None, location: str = None) -> dict:
         """Search for job openings using Linkup."""
@@ -60,29 +63,13 @@ class LinkupJobSearch:
 
     def get_company_profile(self, company: str) -> dict:
         """Research company background, funding, culture, tech stack."""
-        query = f"{company} company overview funding tech stack culture engineering team 2025"
-
         print(f"🏢 Researching company: {company}")
-        response = self.client.search(
-            query=query,
-            depth="deep",
-            output_type="searchResults",
-            include_images=False,
-        )
-        return response
+        return self.company_research_agent.research_profile(company)
 
     def get_company_sentiment(self, company: str) -> dict:
         """Get employee reviews and sentiment analysis."""
-        query = f"{company} employee reviews glassdoor engineering culture work life balance"
-
         print(f"💬 Analyzing sentiment: {company}")
-        response = self.client.search(
-            query=query,
-            depth="standard",
-            output_type="searchResults",
-            include_images=False,
-        )
-        return response
+        return self.company_research_agent.research_sentiment(company)
 
     def find_recruiters(self, company: str, role: str) -> dict:
         """Find recruiters and hiring managers."""
