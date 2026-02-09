@@ -184,7 +184,7 @@ class LinkupJobSearch:
             meta={"source_artifact_id": artifact_id, "title": f"Company research for {company}"},
             confidence=0.75,
         )
-        return response
+        return self.company_research_agent.research_profile(company)
 
     def get_company_sentiment(self, company: str) -> dict:
         """Get employee reviews and sentiment analysis."""
