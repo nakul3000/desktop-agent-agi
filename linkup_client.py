@@ -203,8 +203,8 @@ class LinkupJobSearch:
             type="company_sentiment",
             content={"query": query, "company": company, "results": self._results_to_storeable(response)},
         )
-        # Return the research profile so downstream calls get enriched context
-        return self.company_research_agent.research_profile(company)
+        # Return sentiment analysis report from the dedicated agent
+        return self.company_research_agent.research_sentiment(company)
 
     def find_recruiters(self, company: str, role: str) -> dict:
         """Find recruiters and hiring managers."""
