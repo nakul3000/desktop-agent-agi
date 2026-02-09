@@ -82,6 +82,23 @@ class LinkupJobSearch:
             confidence=confidence,
         )
 
+    @staticmethod
+    def _results_to_storeable(response, max_items: int = 20):
+        """
+        Convert Linkup response to a JSON-serializable structure safe for DB storage.
+        Limits the number of stored items to keep artifacts compact.
+        """
+        items = []
+        results = getattr(response, "results", []) or []
+        for r in results[:max_items]:
+            # Pick common fields defensively
+            entry = {}
+            for field in ("name", "url", "content", "description", "title", "snippet"):
+                if hasattr(r, field):
+                    entry[field] = getattr(r, field)
+            items.append(entry)
+        return {"count": len(results), "items": items}
+
     def search_jobs(self, role: str, company: str = None, location: str = None) -> dict:
         """Search for job openings using Linkup."""
         query_parts = [role, "job openings", "2025"]
@@ -104,7 +121,12 @@ class LinkupJobSearch:
         self._log_turn("assistant", f"Linkup returned {len(getattr(response, 'results', []) or [])} results for '{query}'")
         artifact_id = self._log_artifact(
             type="linkup_research",
-            content={"query": query, "location": location, "company": company},
+            content={
+                "query": query,
+                "location": location,
+                "company": company,
+                "results": self._results_to_storeable(response),
+            },
             source_turn_id=user_turn,
         )
         if company:
@@ -140,7 +162,7 @@ class LinkupJobSearch:
 
         artifact_id = self._log_artifact(
             type="company_research",
-            content={"query": query, "company": company},
+            content={"query": query, "company": company, "results": self._results_to_storeable(response)},
         )
         self._log_fact(
             kind="company",
@@ -166,7 +188,7 @@ class LinkupJobSearch:
 
         self._log_artifact(
             type="company_sentiment",
-            content={"query": query, "company": company},
+            content={"query": query, "company": company, "results": self._results_to_storeable(response)},
         )
         return response
 
@@ -185,7 +207,7 @@ class LinkupJobSearch:
 
         self._log_artifact(
             type="recruiter_profile",
-            content={"query": query, "company": company, "role": role},
+            content={"query": query, "company": company, "role": role, "results": self._results_to_storeable(response)},
         )
         return response
 
