@@ -295,7 +295,8 @@ class JobAgent:
             raise ValueError("LINKUP_API_KEY not found in .env")
 
         self.client = InferenceClient(
-            model="meta-llama/Llama-3.3-70B-Instruct",
+            # Use a hosted-inference-available model id
+            model="meta-llama/Meta-Llama-3-70B-Instruct",
             token=self.hf_token,
         )
 
