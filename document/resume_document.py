@@ -34,21 +34,12 @@ def _clean_line(line: str) -> str:
 
 
 def _extract_contact_block(text: str, max_lines: int = 12) -> str:
-    """
-    Resumes usually put contact info in the first few lines.
-    We'll use the top N lines as a high-signal 'contact block'.
-    """
     lines = [ln for ln in text.splitlines() if _clean_line(ln)]
     return "\n".join(lines[:max_lines])
 
 
 def _extract_name_heuristic(contact_block: str) -> Optional[str]:
-    """
-    Candidate name is often a standalone line near the top.
-    Skip headings like "EXAMPLE RESUME".
-    """
     bad_tokens = {"resume", "curriculum", "vitae", "cv"}
-
     lines = [_clean_line(ln) for ln in contact_block.splitlines() if _clean_line(ln)]
     candidates: List[str] = []
 
@@ -97,17 +88,11 @@ def _extract_links(text: str) -> Dict[str, str]:
 
 
 def _extract_contact_fields(text: str) -> Tuple[Dict[str, Any], Dict[str, float]]:
-    """
-    Returns:
-      contact: {name, email, phone, location, links}
-      confidence: per-field confidence
-    """
     contact_block = _extract_contact_block(text)
 
     email = (EMAIL_RE.findall(contact_block) or EMAIL_RE.findall(text) or [None])[0]
     phone = (PHONE_RE.findall(contact_block) or PHONE_RE.findall(text) or [None])[0]
 
-    # Location heuristic: pick LAST City, ST match in contact block to avoid street prefixes.
     location = None
     lines = [_clean_line(ln) for ln in contact_block.splitlines() if _clean_line(ln)]
     loc_re = re.compile(r"\b([A-Za-z][A-Za-z .'-]+?),\s*([A-Z]{2})\b")
@@ -149,7 +134,7 @@ def _extract_contact_fields(text: str) -> Tuple[Dict[str, Any], Dict[str, float]
 SECTION_ALIASES = {
     "objective": ["objective", "summary", "professional summary"],
     "education": ["education", "academics"],
-    "experience": ["work experience", "experience", "employment"],
+    "experience": ["work experience", "experience", "employment", "work"],
     "volunteer_experience": ["volunteer experience", "volunteering"],
     "projects": ["projects", "project experience"],
     "skills": ["skills", "technical skills", "core skills"],
@@ -164,10 +149,6 @@ def _normalize_heading(s: str) -> str:
 
 
 def _is_heading_line(line: str) -> bool:
-    """
-    Detect resume section headings.
-    Heuristic: mostly uppercase, short, and not containing email/phone/url.
-    """
     ln = _clean_line(line)
     if not ln:
         return False
@@ -194,9 +175,6 @@ def _map_heading_to_section(heading: str) -> Optional[str]:
 
 
 def split_resume_sections(text: str) -> Dict[str, str]:
-    """
-    Split resume into sections keyed by canonical section names.
-    """
     lines = list(text.splitlines())
     current_section = "header"
     buckets: Dict[str, List[str]] = {"header": []}
@@ -251,9 +229,6 @@ def _normalize_month(m: str) -> Optional[str]:
 
 
 def _clean_year(y: str) -> Optional[str]:
-    """
-    Handle OCR noise in year like 201& or 20I8 by normalizing to digits.
-    """
     y = (y or "").strip()
     y = y.replace("&", "8").replace("O", "0").replace("I", "1").replace("l", "1")
     y = re.sub(r"[^\d]", "", y)
@@ -300,21 +275,14 @@ def _looks_like_experience_header(line: str) -> bool:
     ln = _clean_line(line)
     if not ln:
         return False
-
     start, end = _parse_date_range(ln)
     if not start and not end:
         return False
-
-    # Require some non-date title content before the month/year
     left = re.split(r"[•|·]", ln)[0].strip()
     return len(left) >= 3
 
 
 def parse_experience_section(section_text: str) -> List[Dict[str, Any]]:
-    """
-    Parse an experience-like section into entries with:
-      title, start_date, end_date, bullets
-    """
     lines = [_clean_line(ln) for ln in section_text.splitlines() if _clean_line(ln)]
     entries: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
@@ -330,7 +298,6 @@ def parse_experience_section(section_text: str) -> List[Dict[str, Any]]:
 
             start, end = _parse_date_range(ln)
 
-            # Title is the part before the first bullet separator, if present
             title_part = re.split(r"[•|·]", ln)[0].strip()
             title_part = title_part.replace("  ", " ").strip(" -•·")
 
@@ -345,7 +312,6 @@ def parse_experience_section(section_text: str) -> List[Dict[str, Any]]:
 
         if current:
             cleaned = ln.lstrip("•").strip()
-            # avoid accidentally pulling in headings
             if _is_heading_line(cleaned) and _map_heading_to_section(cleaned):
                 continue
             current["bullets"].append(cleaned)
@@ -358,14 +324,71 @@ def parse_experience_section(section_text: str) -> List[Dict[str, Any]]:
 
 
 # -------------------------
+# Skill inference (fallback when no SKILLS section)
+# -------------------------
+SKILL_KEYWORDS = {
+    "technical": [
+        "python", "java", "javascript", "typescript", "sql", "react", "node", "aws", "gcp", "azure",
+        "docker", "kubernetes", "git", "linux", "spark", "pandas", "numpy", "mongodb", "postgres",
+        "mysql", "snowflake", "tableau", "power bi", "excel",
+    ],
+    "soft_skills": [
+        "leadership", "communication", "teamwork", "collaboration", "time management",
+        "problem solving", "customer service", "organization",
+    ],
+    "domain": [
+        "data mining", "nlp", "machine learning", "analytics", "talent acquisition",
+        "operations", "recruiting",
+    ],
+}
+
+def infer_skills_from_text(text: str) -> Dict[str, List[str]]:
+    """
+    Very lightweight keyword scan to infer skills.
+    Returns categorized skills, deduped.
+    """
+    t = " " + re.sub(r"\s+", " ", text.lower()) + " "
+    found: Dict[str, List[str]] = {k: [] for k in SKILL_KEYWORDS.keys()}
+
+    for cat, skills in SKILL_KEYWORDS.items():
+        for s in skills:
+            # word-boundary-ish match
+            pattern = r"(?<![a-z0-9])" + re.escape(s) + r"(?![a-z0-9])"
+            if re.search(pattern, t):
+                found[cat].append(s)
+
+    # Dedup + stable sort
+    for k in list(found.keys()):
+        found[k] = sorted(set(found[k]))
+        if not found[k]:
+            found.pop(k, None)
+
+    return found
+
+def flatten_skills(skills_by_cat: Dict[str, List[str]]) -> List[str]:
+    out: List[str] = []
+    for _, items in skills_by_cat.items():
+        out.extend(items)
+    # unique preserving order
+    seen = set()
+    uniq = []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq
+
+
+# -------------------------
 # Main entry point
 # -------------------------
 def process_resume(document_path: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Resume domain entry point.
-    Step A: Extract raw text (local-first).
-    Step B: Extract contact info.
-    Step C: Section map + experience parsing.
+    A: Extract raw text
+    B: Contact info
+    C: Sections + Experience parsing + Volunteer split
+    D: Skills inference (fallback)
     """
     context = context or {}
     path = Path(document_path)
@@ -397,10 +420,22 @@ def process_resume(document_path: str, context: Optional[Dict[str, Any]] = None)
 
     contact, contact_conf = _extract_contact_fields(text)
     sections = split_resume_sections(text)
+
     experience_entries = parse_experience_section(sections.get("experience", ""))
-    volunteer_entries = [e for e in experience_entries if "volunteer" in (e.get("title","").lower())]
+    volunteer_entries = [e for e in experience_entries if "volunteer" in (e.get("title", "").lower())]
     experience_entries = [e for e in experience_entries if e not in volunteer_entries]
 
+    # Skill inference from all major text blocks
+    combined_for_skills = "\n".join(
+        [
+            sections.get("education", ""),
+            sections.get("activities", ""),
+            sections.get("experience", ""),
+            sections.get("objective", ""),
+        ]
+    )
+    skills_inferred = infer_skills_from_text(combined_for_skills)
+    skills_flat = flatten_skills(skills_inferred)
 
     if text_len < 200:
         note = "Very little text extracted. Resume may be image-based; OCR fallback not enabled yet."
@@ -410,6 +445,10 @@ def process_resume(document_path: str, context: Optional[Dict[str, Any]] = None)
         text_conf = 0.9
 
     confidence = {"text_extraction": text_conf, **contact_conf}
+    if skills_flat:
+        confidence["skills.inferred"] = 0.6
+    else:
+        confidence["skills.inferred"] = 0.2
 
     return {
         "status": "ok",
@@ -424,9 +463,10 @@ def process_resume(document_path: str, context: Optional[Dict[str, Any]] = None)
             "contact": contact,
             "sections": sections,
             "experience": experience_entries,
-            "text": text,
             "volunteer_experience": volunteer_entries,
-
+            "skills_inferred": skills_inferred,
+            "skills_flat": skills_flat,
+            "text": text,
         },
         "confidence": confidence,
         "citations": [],
