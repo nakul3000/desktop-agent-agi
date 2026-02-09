@@ -110,14 +110,18 @@ class LinkupJobSearch:
             items.append(entry)
         return {"count": len(results), "items": items}
 
+    @staticmethod
+    def _compose_job_query(role: str, company: str | None = None, location: str | None = None) -> str:
+        parts = [role, "job openings", "2025"]
+        if company:
+            parts.insert(0, company)
+        if location:
+            parts.append(location)
+        return " ".join(parts)
+
     def search_jobs(self, role: str, company: str = None, location: str = None) -> dict:
         """Search for job openings using Linkup."""
-        query_parts = [role, "job openings", "2025"]
-        if company:
-            query_parts.insert(0, company)
-        if location:
-            query_parts.append(location)
-        query = " ".join(query_parts)
+        query = self._compose_job_query(role=role, company=company, location=location)
 
         user_turn = self._log_turn("user", f"Search jobs query: {query}")
 
@@ -160,9 +164,9 @@ class LinkupJobSearch:
             )
         return response
 
-    def get_company_profile(self, company: str) -> dict:
+    def get_company_profile(self, company: str, query: str | None = None) -> dict:
         """Research company background, funding, culture, tech stack."""
-        query = f"{company} company overview funding tech stack culture engineering team 2025"
+        query = query or f"{company} company overview funding tech stack culture engineering team 2025"
 
         self._log_turn("user", f"Research company profile: {company}")
         print(f"🏢 Researching company: {company}")
@@ -186,9 +190,9 @@ class LinkupJobSearch:
         )
         return self.company_research_agent.research_profile(company)
 
-    def get_company_sentiment(self, company: str) -> dict:
+    def get_company_sentiment(self, company: str, query: str | None = None) -> dict:
         """Get employee reviews and sentiment analysis."""
-        query = f"{company} employee reviews glassdoor engineering culture work life balance"
+        query = query or f"{company} employee reviews glassdoor engineering culture work life balance"
 
         self._log_turn("user", f"Analyze sentiment for {company}")
         print(f"💬 Analyzing sentiment: {company}")
@@ -206,9 +210,9 @@ class LinkupJobSearch:
         # Return sentiment analysis report from the dedicated agent
         return self.company_research_agent.research_sentiment(company)
 
-    def find_recruiters(self, company: str, role: str) -> dict:
+    def find_recruiters(self, company: str, role: str, query: str | None = None) -> dict:
         """Find recruiters and hiring managers."""
-        query = f"{company} recruiter hiring manager {role} LinkedIn"
+        query = query or f"{company} recruiter hiring manager {role} LinkedIn"
 
         self._log_turn("user", f"Find recruiters for {company} - {role}")
         print(f"👤 Finding recruiters: {company} - {role}")
@@ -225,17 +229,19 @@ class LinkupJobSearch:
         )
         return response
 
-    def full_research(self, role: str, company: str, location: str = None) -> dict:
+    def full_research(self, role: str, company: str, location: str = None, user_query: str | None = None) -> dict:
         """Run the full research pipeline for a job query."""
         print(f"\n{'='*80}")
         print(f"🚀 Full Research Pipeline: {role} at {company}")
         print(f"{'='*80}\n")
 
+        query = user_query or self._compose_job_query(role=role, company=company, location=location)
+
         results = {
             "jobs": self.search_jobs(role, company, location),
-            "company_profile": self.get_company_profile(company),
-            "sentiment": self.get_company_sentiment(company),
-            "recruiters": self.find_recruiters(company, role),
+            "company_profile": self.get_company_profile(company, query=query),
+            "sentiment": self.get_company_sentiment(company, query=query),
+            "recruiters": self.find_recruiters(company, role, query=query),
         }
 
         # Print summary
