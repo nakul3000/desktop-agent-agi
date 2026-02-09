@@ -4,6 +4,7 @@
 import os
 import json
 import re
+import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
@@ -273,7 +274,7 @@ TOOL_EXECUTORS = {
 # ------------------------------------------------------------------ #
 
 class JobAgent:
-    def __init__(self):
+    def __init__(self, session_id: str | None = None, user_id: str | None = None):
         self.hf_token = os.getenv("HF_TOKEN")
         if not self.hf_token:
             raise ValueError("HF_TOKEN not found in .env")
@@ -295,8 +296,9 @@ class JobAgent:
         })
 
         # Initialize memory
-        self.session_id = os.getenv("SESSION_ID") or "default"
-        self.user_id = os.getenv("USER_ID") or "anonymous"
+        # Derive user/session IDs: prefer explicit args, then env, then fallbacks
+        self.user_id = user_id or os.getenv("USER_ID") or "anonymous"
+        self.session_id = session_id or os.getenv("SESSION_ID") or str(uuid.uuid4())
         memory.init_db()
         memory.register_user(self.user_id)
         memory.start_session(user_id=self.user_id, session_id=self.session_id)
