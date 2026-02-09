@@ -8,6 +8,16 @@ import memory
 
 load_dotenv()
 
+_DB_INITIALIZED = False
+
+
+def _ensure_db_initialized() -> None:
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    memory.init_db()
+    _DB_INITIALIZED = True
+
 
 class ResultFormatter:
     """Formats Linkup search results for readable output."""
@@ -41,10 +51,12 @@ class LinkupJobSearch:
         if not api_key:
             raise ValueError("LINKUP_API_KEY not found in .env")
 
-        memory.init_db()
+        _ensure_db_initialized()
         self.user_id = user_id or os.getenv("USER_ID") or "anonymous"
         memory.register_user(self.user_id)
-        self.session_id = session_id or memory.start_session(user_id=self.user_id)
+        # Reuse a stable session if provided; otherwise default to env or "default"
+        self.session_id = session_id or os.getenv("SESSION_ID") or "default"
+        memory.start_session(user_id=self.user_id, session_id=self.session_id)
         self.client = LinkupClient(api_key=api_key)
 
     # --- memory helpers ---
@@ -220,7 +232,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("TEST 1: Simple Job Search")
     print("=" * 80)
-    jobs = searcher.search_jobs("Machine Learning Engineer", company="Amazon", location="USA")
+    jobs = searcher.search_jobs("Senior Software Engineer", company="Zapier", location="USA")
     formatter.format_results(jobs, max_results=5)
 
     # Test 2: Full pipeline
