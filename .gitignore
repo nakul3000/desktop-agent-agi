@@ -36,6 +36,9 @@ wheels/
 .env
 .env.local
 
+# Local SQLite database
+memory.db
+
 # OS
 .DS_Store
 Thumbs.db
