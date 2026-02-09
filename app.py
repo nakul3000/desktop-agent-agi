@@ -297,8 +297,8 @@ class JobAgent:
 
         # Initialize memory
         # Derive user/session IDs: prefer explicit args, then env, then fallbacks
-        self.user_id = user_id or os.getenv("USER_ID") or "anonymous"
-        self.session_id = session_id or os.getenv("SESSION_ID") or str(uuid.uuid4())
+        self.user_id = user_id or "anonymous"
+        self.session_id = session_id or str(uuid.uuid4())
         memory.init_db()
         memory.register_user(self.user_id)
         memory.start_session(user_id=self.user_id, session_id=self.session_id)
