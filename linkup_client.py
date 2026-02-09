@@ -4,15 +4,64 @@ from datetime import datetime
 from dotenv import load_dotenv
 from linkup import LinkupClient
 
+from company_research_agent import CompanyResearchAgent, JobPostingIntake
+
 load_dotenv()
+
+_DB_INITIALIZED = False
+
+
+def _ensure_db_initialized() -> None:
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    memory.init_db()
+    _DB_INITIALIZED = True
 
 
 class LinkupJobSearch:
-    def __init__(self):
+    def __init__(self, session_id: str | None = None, user_id: str | None = None):
         api_key = os.getenv("LINKUP_API_KEY")
         if not api_key:
             raise ValueError("LINKUP_API_KEY not found in .env")
+
+        _ensure_db_initialized()
+        self.user_id = user_id or os.getenv("USER_ID") or "anonymous"
+        memory.register_user(self.user_id)
+        # Reuse a stable session if provided; otherwise default to env or "default"
+        self.session_id = session_id or os.getenv("SESSION_ID") or "default"
+        memory.start_session(user_id=self.user_id, session_id=self.session_id)
         self.client = LinkupClient(api_key=api_key)
+        self.company_research_agent = CompanyResearchAgent(self.client)
+
+    def build_job_intake(self, selected_jd_payload: dict) -> JobPostingIntake:
+        """
+        Normalize the "user selected one JD" payload into a stable intake object.
+
+        Expected shape (example):
+          { "answer": "...", "sources": [ { "url": "...", "snippet": "...", ... } ] }
+        """
+        return JobPostingIntake.from_selected_jd_payload(selected_jd_payload)
+
+    def research_from_selected_jd(self, selected_jd_payload: dict) -> dict:
+        """
+        Convenience method: build the intake and run company research using it as context.
+        Missing fields remain literal "NA" (no re-search / enrichment).
+        """
+        intake = self.build_job_intake(selected_jd_payload)
+
+        company = intake.company_name if intake.company_name != "NA" else "NA"
+        role = None if intake.role_title == "NA" else intake.role_title
+        job_url = None if intake.job_url == "NA" else intake.job_url
+        job_description = None if intake.answer == "NA" else intake.answer
+
+        return self.company_research_agent.research_company(
+            company=company,
+            role=role,
+            job_url=job_url,
+            job_description=job_description,
+            job_intake=intake,
+        )
 
     def search_jobs(self, role: str, company: str = None, location: str = "United States") -> dict:
         """
@@ -62,24 +111,43 @@ Return all qualifying job links and details. Prioritize official {company_name} 
             output_type="searchResults",
             include_images=False,
         )
+
+        self._log_turn("assistant", f"Linkup returned {len(getattr(response, 'results', []) or [])} results for '{query}'")
+        artifact_id = self._log_artifact(
+            type="linkup_research",
+            content={
+                "query": query,
+                "location": location,
+                "company": company,
+                "results": self._results_to_storeable(response),
+            },
+            source_turn_id=user_turn,
+        )
+        if company:
+            self._log_fact(
+                kind="preference",
+                key="target_company",
+                value=company,
+                meta={"source_artifact_id": artifact_id, "title": f"Target company {company}"},
+                source_artifact_id=artifact_id,
+                confidence=0.9,
+            )
+        if role:
+            self._log_fact(
+                kind="preference",
+                key="target_role",
+                value=role,
+                meta={"source_artifact_id": artifact_id, "title": f"Target role {role}"},
+                source_artifact_id=artifact_id,
+                confidence=0.85,
+            )
         return response
 
-    def get_company_profile(self, company: str) -> dict:
+    def get_company_profile(self, company: str, query: str | None = None) -> dict:
         """Research company background, funding, culture, tech stack."""
-        today = datetime.now().strftime("%B %d, %Y")
+        query = query or f"{company} company overview funding tech stack culture engineering team 2025"
 
-        query = f"""You are a company research analyst. Research {company} thoroughly as of {today}.
-
-Extract the following:
-1) Company Overview: What does {company} do? Industry, size, headquarters.
-2) Recent News: Any major announcements, product launches, acquisitions in the last 30 days.
-3) Financial Health: Latest revenue, funding rounds, stock performance, growth trajectory.
-4) Tech Stack & AI Initiatives: What technologies does {company} use? Any AI/ML initiatives?
-5) Engineering Culture: How is the engineering org structured? Key engineering leaders.
-6) Growth Areas: Where is {company} investing and hiring the most?
-
-Focus on authoritative sources: official blog, press releases, SEC filings, TechCrunch, Bloomberg."""
-
+        self._log_turn("user", f"Research company profile: {company}")
         print(f"🏢 Researching company: {company}")
         response = self.client.search(
             query=query,
@@ -87,22 +155,25 @@ Focus on authoritative sources: official blog, press releases, SEC filings, Tech
             output_type="searchResults",
             include_images=False,
         )
-        return response
 
-    def get_company_sentiment(self, company: str) -> dict:
+        artifact_id = self._log_artifact(
+            type="company_research",
+            content={"query": query, "company": company, "results": self._results_to_storeable(response)},
+        )
+        self._log_fact(
+            kind="company",
+            key="company_name",
+            value=company,
+            meta={"source_artifact_id": artifact_id, "title": f"Company research for {company}"},
+            confidence=0.75,
+        )
+        return self.company_research_agent.research_profile(company)
+
+    def get_company_sentiment(self, company: str, query: str | None = None) -> dict:
         """Get employee reviews and sentiment analysis."""
-        query = f"""You are an employee sentiment analyst. Analyze current employee sentiment at {company}.
+        query = query or f"{company} employee reviews glassdoor engineering culture work life balance"
 
-Research:
-1) Glassdoor reviews for {company} engineering and ML teams — overall rating, pros, cons.
-2) Blind app discussions about {company} work culture and compensation.
-3) Recent layoffs, reorgs, or morale issues at {company}.
-4) Work-life balance reputation in engineering roles.
-5) Interview process difficulty and candidate experience.
-6) Compensation competitiveness — how does {company} pay vs FAANG/industry?
-
-Summarize: overall sentiment score (1-10), top 3 pros, top 3 cons, red flags if any."""
-
+        self._log_turn("user", f"Analyze sentiment for {company}")
         print(f"💬 Analyzing sentiment: {company}")
         response = self.client.search(
             query=query,
@@ -110,21 +181,19 @@ Summarize: overall sentiment score (1-10), top 3 pros, top 3 cons, red flags if 
             output_type="searchResults",
             include_images=False,
         )
-        return response
 
-    def find_recruiters(self, company: str, role: str) -> dict:
+        self._log_artifact(
+            type="company_sentiment",
+            content={"query": query, "company": company, "results": self._results_to_storeable(response)},
+        )
+        # Return sentiment analysis report from the dedicated agent
+        return self.company_research_agent.research_sentiment(company)
+
+    def find_recruiters(self, company: str, role: str, query: str | None = None) -> dict:
         """Find recruiters and hiring managers."""
-        query = f"""You are a networking specialist. Find recruiters and hiring managers at {company} who hire for {role} positions.
+        query = query or f"{company} recruiter hiring manager {role} LinkedIn"
 
-Search for:
-1) {company} technical recruiters on LinkedIn who focus on ML/AI hiring.
-2) {company} engineering hiring managers for {role} teams.
-3) Their LinkedIn profile URLs, names, and titles.
-4) Any recent posts they've made about open roles or hiring.
-5) {company} talent acquisition team members in the US.
-
-Prioritize people who have recently posted about hiring or open positions."""
-
+        self._log_turn("user", f"Find recruiters for {company} - {role}")
         print(f"👤 Finding recruiters: {company} - {role}")
         response = self.client.search(
             query=query,
@@ -132,9 +201,14 @@ Prioritize people who have recently posted about hiring or open positions."""
             output_type="searchResults",
             include_images=False,
         )
+
+        self._log_artifact(
+            type="recruiter_profile",
+            content={"query": query, "company": company, "role": role, "results": self._results_to_storeable(response)},
+        )
         return response
 
-    def full_research(self, role: str, company: str, location: str = "United States") -> dict:
+    def full_research(self, role: str, company: str, location: str = None, user_query: str | None = None) -> dict:
         """Run the full research pipeline for a job query."""
         print(f"\n{'='*60}")
         print(f"🚀 Full Research: {role} at {company}")
@@ -142,18 +216,20 @@ Prioritize people who have recently posted about hiring or open positions."""
         print(f"📅 Date: {datetime.now().strftime('%B %d, %Y')}")
         print(f"{'='*60}\n")
 
+        query = user_query or self._compose_job_query(role=role, company=company, location=location)
+
         results = {
             "jobs": self.search_jobs(role, company, location),
-            "company_profile": self.get_company_profile(company),
-            "sentiment": self.get_company_sentiment(company),
-            "recruiters": self.find_recruiters(company, role),
+            "company_profile": self.get_company_profile(company, query=query),
+            "sentiment": self.get_company_sentiment(company, query=query),
+            "recruiters": self.find_recruiters(company, role, query=query),
         }
 
         print(f"\n{'='*60}")
         print("✅ Research Complete!")
-        print(f"{'='*60}")
+        print(f"{'='*80}")
         for key, value in results.items():
-            if hasattr(value, "results"):
+            if hasattr(value, 'results'):
                 print(f"  📄 {key}: {len(value.results)} results found")
             else:
                 print(f"  📄 {key}: {type(value).__name__}")
