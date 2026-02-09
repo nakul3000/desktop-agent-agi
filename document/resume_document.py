@@ -1,10 +1,10 @@
 from __future__ import annotations
+
 from typing import Any, Dict, Optional, Tuple
 from pathlib import Path
 import re
 
 from document.extract_text import extract_text
-
 
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 PHONE_RE = re.compile(
@@ -45,20 +45,25 @@ def _extract_name_heuristic(contact_block: str) -> Optional[str]:
     """
     Heuristic: candidate name is often a standalone line near the top,
     in Title Case or ALL CAPS, not containing email/phone/url.
+    Skip obvious headings like "EXAMPLE RESUME".
     """
+    bad_tokens = {"resume", "curriculum", "vitae", "cv"}
+
     lines = [_clean_line(ln) for ln in contact_block.splitlines() if _clean_line(ln)]
-    # Skip lines that clearly contain contact tokens
-    filtered = []
+
+    candidates: list[str] = []
     for ln in lines:
+        low = ln.lower()
+        if any(tok in low for tok in bad_tokens):
+            continue
         if EMAIL_RE.search(ln) or PHONE_RE.search(ln) or URL_RE.search(ln):
             continue
-        # avoid headings like "EXAMPLE RESUME"
         if len(ln) > 45:
             continue
-        filtered.append(ln)
+        candidates.append(ln)
 
-    # Prefer the first plausible line with 2-4 words
-    for ln in filtered[:6]:
+    # Prefer a 2–4 word alphabetic line near the top
+    for ln in candidates[:8]:
         words = ln.replace(",", " ").split()
         if 2 <= len(words) <= 4 and all(w.isalpha() for w in words):
             return ln.title() if ln.isupper() else ln
@@ -86,7 +91,6 @@ def _extract_links(text: str) -> Dict[str, str]:
                 label = key
                 break
 
-        # keep first of each label
         if label not in links:
             links[label] = u
 
@@ -104,22 +108,28 @@ def _extract_contact_fields(text: str) -> Tuple[Dict[str, Any], Dict[str, float]
       confidence: per-field confidence
     """
     contact_block = _extract_contact_block(text)
+
     email = (EMAIL_RE.findall(contact_block) or EMAIL_RE.findall(text) or [None])[0]
     phone = (PHONE_RE.findall(contact_block) or PHONE_RE.findall(text) or [None])[0]
 
-    # Basic location heuristic: find a line with city/state pattern in contact block
+    # Location heuristic: capture the LAST City, ST match in contact block.
+    # This avoids grabbing street prefixes.
     location = None
     lines = [_clean_line(ln) for ln in contact_block.splitlines() if _clean_line(ln)]
-    # Example matches: "Modesto, CA" or "Modesto, CA, 71234"
-    loc_re = re.compile(r"\b([A-Za-z .'-]+),\s*([A-Z]{2})(?:\s*,?\s*\d{5})?\b")
+
+    loc_re = re.compile(r"\b([A-Za-z][A-Za-z .'-]+?),\s*([A-Z]{2})\b")
+    matches = []
     for ln in lines:
-        m = loc_re.search(ln)
-        if m:
-            location = f"{m.group(1).strip()}, {m.group(2).strip()}"
-            break
+        for m in loc_re.finditer(ln):
+            matches.append((ln, m.group(1).strip(), m.group(2).strip()))
+
+    if matches:
+        _, city_raw, state = matches[-1]
+        # Strip street prefixes like "234 FAKE STREET. MODESTO"
+        city = city_raw.split(".")[-1].strip()
+        location = f"{city}, {state}"
 
     name = _extract_name_heuristic(contact_block)
-
     links = _extract_links(text)
 
     confidence = {
