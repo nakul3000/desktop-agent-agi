@@ -28,6 +28,217 @@ def _now_utc_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+# -----------------------------
+# JD intake (selected job) schema
+# -----------------------------
+
+_NA = "NA"
+
+
+@dataclasses.dataclass
+class JobPostingIntake:
+    """
+    Normalized intake for a single *selected* JD.
+
+    This is designed to match the object you get back when the user chooses one JD,
+    typically shaped like:
+      { "answer": "<summary text>", "sources": [ { "url": "...", "snippet": "...", ... } ] }
+
+    All missing fields are stored as the literal string "NA" (per your preference).
+    """
+
+    # Raw payload (kept for traceability)
+    answer: str = _NA
+    sources: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+
+    # Commonly used extracted fields
+    company_name: str = _NA
+    role_title: str = _NA
+    location: str = _NA
+    workplace_type: str = _NA  # remote | hybrid | on-site | NA
+    employment_type: str = _NA  # full-time | part-time | contract | NA
+
+    compensation_summary: str = _NA
+    requirements_summary: str = _NA
+    preferred_summary: str = _NA
+
+    job_url: str = _NA
+    extracted_at: str = dataclasses.field(default_factory=_now_utc_iso)
+
+    def to_context_dict(self) -> Dict[str, Any]:
+        # Keep context compact but complete.
+        return {
+            "job_intake": dataclasses.asdict(self),
+            "job_url": self.job_url,
+            "company": self.company_name,
+            "role": self.role_title,
+            "location": self.location,
+            "workplace_type": self.workplace_type,
+            "employment_type": self.employment_type,
+            "compensation_summary": self.compensation_summary,
+            "requirements_summary": self.requirements_summary,
+            "preferred_summary": self.preferred_summary,
+        }
+
+    @staticmethod
+    def from_selected_jd_payload(payload: Any) -> "JobPostingIntake":
+        """
+        Accepts either:
+        - dict with keys like 'answer' and 'sources'
+        - an SDK object with attributes .answer and .sources
+        """
+
+        answer = _safe_getattr(payload, "answer", None)
+        sources = _safe_getattr(payload, "sources", None)
+        if isinstance(payload, dict):
+            answer = payload.get("answer", answer)
+            sources = payload.get("sources", sources)
+
+        answer = (answer or "").strip() or _NA
+        sources_list: List[Dict[str, Any]] = []
+        if isinstance(sources, list):
+            for s in sources:
+                if isinstance(s, dict):
+                    sources_list.append(
+                        {
+                            "name": (s.get("name") or "").strip() or None,
+                            "url": (s.get("url") or "").strip() or None,
+                            "snippet": (s.get("snippet") or "").strip() or None,
+                            "favicon": (s.get("favicon") or "").strip() or None,
+                        }
+                    )
+                else:
+                    sources_list.append(_source_to_dict(s))
+
+        job_url = _extract_best_job_url(sources_list)
+
+        company, role, location = _extract_company_role_location(answer)
+        workplace = _extract_workplace_type(answer)
+        employment = _extract_employment_type(answer)
+        comp = _extract_section_block(answer, header="Salary range")
+        reqs = _extract_section_block(answer, header="Requirements")
+        pref = _extract_section_block(answer, header="Preferred")
+
+        return JobPostingIntake(
+            answer=answer,
+            sources=sources_list,
+            company_name=company,
+            role_title=role,
+            location=location,
+            workplace_type=workplace,
+            employment_type=employment,
+            compensation_summary=comp,
+            requirements_summary=reqs,
+            preferred_summary=pref,
+            job_url=job_url,
+        )
+
+
+def _extract_best_job_url(sources: List[Dict[str, Any]]) -> str:
+    # Prefer a URL that looks like an ATS / job posting.
+    for s in sources or []:
+        url = (s.get("url") or "").strip()
+        if not url:
+            continue
+        u = url.lower()
+        if any(
+            token in u
+            for token in (
+                "workdayjobs.com",
+                "/job/",
+                "/jobs/",
+                "greenhouse.io",
+                "lever.co",
+                "myworkdayjobs.com",
+                "icims.com",
+                "smartrecruiters.com",
+            )
+        ):
+            return url
+    # Fallback: first URL.
+    for s in sources or []:
+        url = (s.get("url") or "").strip()
+        if url:
+            return url
+    return _NA
+
+
+_HIRING_RE = re.compile(
+    r"^\s*(?P<company>.+?)\s+is\s+hiring\s+(?:an?|the)\s+(?P<role>.+?)(?:\s+for\s+.+?)?\s+in\s+(?P<location>.+?)\.\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_company_role_location(answer: str) -> Tuple[str, str, str]:
+    """
+    Best-effort extraction for the common LinkUp 'sourcedAnswer' style:
+      '<Company> is hiring a <Role> ... in <Location>.'
+    """
+    if not answer or answer == _NA:
+        return _NA, _NA, _NA
+
+    m = _HIRING_RE.match(answer)
+    if not m:
+        return _NA, _NA, _NA
+
+    company = (m.group("company") or "").strip() or _NA
+    role = (m.group("role") or "").strip() or _NA
+    location = (m.group("location") or "").strip() or _NA
+    return company, role, location
+
+
+def _extract_workplace_type(answer: str) -> str:
+    if not answer or answer == _NA:
+        return _NA
+    lowered = answer.lower()
+    # Look for explicit statement first.
+    if "position is hybrid" in lowered or lowered.rstrip().endswith("hybrid."):
+        return "hybrid"
+    if "position is remote" in lowered or lowered.rstrip().endswith("remote."):
+        return "remote"
+    if "position is on-site" in lowered or "position is onsite" in lowered or lowered.rstrip().endswith("on-site."):
+        return "on-site"
+    return _NA
+
+
+def _extract_employment_type(answer: str) -> str:
+    if not answer or answer == _NA:
+        return _NA
+    lowered = answer.lower()
+    for label in ("full-time", "part-time", "contract", "internship", "temporary"):
+        if label in lowered:
+            return label
+    return _NA
+
+
+_HEADER_RE_TEMPLATE = r"(?im)^\s*{header}\s*:\s*$"
+
+
+def _extract_section_block(answer: str, *, header: str) -> str:
+    """
+    Extract a block that starts after a header like 'Requirements:' and ends
+    before the next top-level header (e.g., 'Preferred:', 'Salary range:', etc.).
+    Returns 'NA' if not found.
+    """
+    if not answer or answer == _NA:
+        return _NA
+
+    header_re = re.compile(_HEADER_RE_TEMPLATE.format(header=re.escape(header)))
+    m = header_re.search(answer)
+    if not m:
+        return _NA
+
+    start = m.end()
+    rest = answer[start:]
+
+    # Stop at the next header-like line ("Word(s):") that begins at line start.
+    next_header = re.search(r"(?im)^\s*[A-Za-z][A-Za-z \-/]{0,40}\s*:\s*$", rest)
+    block = rest[: next_header.start()] if next_header else rest
+
+    block = block.strip()
+    return block or _NA
+
+
 def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
     try:
         return getattr(obj, name)
@@ -158,6 +369,8 @@ class CompanyResearchAgent:
         role: Optional[str] = None,
         job_url: Optional[str] = None,
         job_description: Optional[str] = None,
+        *,
+        job_intake: Optional[JobPostingIntake] = None,
     ) -> Dict[str, Any]:
         context = {
             "company": company,
@@ -165,6 +378,9 @@ class CompanyResearchAgent:
             "job_url": job_url,
             "job_description": job_description,
         }
+        if job_intake is not None:
+            # Note: keep both the raw intake dict and the key fields at top-level for prompts.
+            context.update(job_intake.to_context_dict())
         profile = self.research_profile(company, context=context)
         sentiment = self.research_sentiment(company, context=context)
         return {
