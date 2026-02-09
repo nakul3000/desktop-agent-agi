@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from linkup import LinkupClient
 
 import memory
+from company_research_agent import CompanyResearchAgent
 
 load_dotenv()
 
@@ -58,6 +59,7 @@ class LinkupJobSearch:
         self.session_id = session_id or os.getenv("SESSION_ID") or "default"
         memory.start_session(user_id=self.user_id, session_id=self.session_id)
         self.client = LinkupClient(api_key=api_key)
+        self.company_research_agent = CompanyResearchAgent(self.client)
 
     # --- memory helpers ---
     def _log_turn(self, role: str, text: str) -> int:
@@ -72,13 +74,22 @@ class LinkupJobSearch:
             created_by=created_by,
         )
 
-    def _log_fact(self, kind: str, key: str, value: str, meta=None, confidence: float = 0.8):
+    def _log_fact(
+        self,
+        kind: str,
+        key: str,
+        value: str,
+        meta=None,
+        confidence: float = 0.8,
+        source_artifact_id=None,
+    ):
         return memory.store_fact(
             session_id=self.session_id,
             kind=kind,
             key=key,
             value=value,
             meta=meta or {},
+            source_artifact_id=source_artifact_id,
             confidence=confidence,
         )
 
@@ -135,6 +146,7 @@ class LinkupJobSearch:
                 key="target_company",
                 value=company,
                 meta={"source_artifact_id": artifact_id, "title": f"Target company {company}"},
+                source_artifact_id=artifact_id,
                 confidence=0.9,
             )
         if role:
@@ -143,6 +155,7 @@ class LinkupJobSearch:
                 key="target_role",
                 value=role,
                 meta={"source_artifact_id": artifact_id, "title": f"Target role {role}"},
+                source_artifact_id=artifact_id,
                 confidence=0.85,
             )
         return response
