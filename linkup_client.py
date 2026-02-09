@@ -1,6 +1,6 @@
 # Linkup API client for agentic search
-
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 from linkup import LinkupClient
 
@@ -17,32 +17,6 @@ def _ensure_db_initialized() -> None:
         return
     memory.init_db()
     _DB_INITIALIZED = True
-
-
-class ResultFormatter:
-    """Formats Linkup search results for readable output."""
-    
-    @staticmethod
-    def format_results(results, max_results: int = 10):
-        """Format search results in a clean, readable way."""
-        if not hasattr(results, 'results') or not results.results:
-            print("❌ No results found")
-            return
-        
-        print(f"\n📊 Found {len(results.results)} results (showing top {min(len(results.results), max_results)})\n")
-        
-        for idx, result in enumerate(results.results[:max_results], 1):
-            print(f"\n{'─' * 80}")
-            print(f"📌 Result #{idx}")
-            print(f"{'─' * 80}")
-            print(f"Title: {result.name}")
-            print(f"URL: {result.url}")
-            if hasattr(result, 'content') and result.content:
-                content_preview = result.content[:300].strip()
-                if len(result.content) > 300:
-                    content_preview += "..."
-                print(f"\nPreview: {content_preview}")
-            print()
 
 
 class LinkupJobSearch:
@@ -89,74 +63,48 @@ class LinkupJobSearch:
             job_intake=intake,
         )
 
-    def search_jobs(self, role: str, company: str = None, location: str = None) -> dict:
-        """Search for job openings using Linkup."""
-        query_parts = [role, "job openings", "2025"]
-    # --- memory helpers ---
-    def _log_turn(self, role: str, text: str) -> int:
-        return memory.store_turn(self.session_id, role=role, text=text)
-
-    def _log_artifact(self, type: str, content, source_turn_id=None, created_by="LinkupJobSearch"):
-        return memory.store_artifact(
-            session_id=self.session_id,
-            type=type,
-            content=content,
-            source_turn_id=source_turn_id,
-            created_by=created_by,
-        )
-
-    def _log_fact(
-        self,
-        kind: str,
-        key: str,
-        value: str,
-        meta=None,
-        confidence: float = 0.8,
-        source_artifact_id=None,
-    ):
-        return memory.store_fact(
-            session_id=self.session_id,
-            kind=kind,
-            key=key,
-            value=value,
-            meta=meta or {},
-            source_artifact_id=source_artifact_id,
-            confidence=confidence,
-        )
-
-    @staticmethod
-    def _results_to_storeable(response, max_items: int = 20):
+    def search_jobs(self, role: str, company: str = None, location: str = "United States") -> dict:
         """
-        Convert Linkup response to a JSON-serializable structure safe for DB storage.
-        Limits the number of stored items to keep artifacts compact.
+        Search for job openings with detailed extraction prompt.
+        Returns individual job links, titles, locations, and descriptions.
         """
-        items = []
-        results = getattr(response, "results", []) or []
-        for r in results[:max_items]:
-            # Pick common fields defensively
-            entry = {}
-            for field in ("name", "url", "content", "description", "title", "snippet"):
-                if hasattr(r, field):
-                    entry[field] = getattr(r, field)
-            items.append(entry)
-        return {"count": len(results), "items": items}
+        today = datetime.now().strftime("%B %d, %Y")
+        company_name = company or "top tech companies"
 
-    @staticmethod
-    def _compose_job_query(role: str, company: str | None = None, location: str | None = None) -> str:
-        parts = [role, "job openings", "2025"]
-        if company:
-            parts.insert(0, company)
-        if location:
-            parts.append(location)
-        return " ".join(parts)
+        # Build search variant terms
+        role_variants = [role]
+        role_lower = role.lower()
+        if "machine learning" in role_lower or "ml" in role_lower:
+            role_variants.extend(["ML engineer", "data scientist machine learning", "AI researcher"])
+        elif "software" in role_lower or "swe" in role_lower:
+            role_variants.extend(["software developer", "backend engineer", "full stack engineer"])
+        elif "data" in role_lower:
+            role_variants.extend(["data analyst", "data engineer", "analytics engineer"])
 
-    def search_jobs(self, role: str, company: str = None, location: str = None) -> dict:
-        """Search for job openings using Linkup."""
-        query = self._compose_job_query(role=role, company=company, location=location)
+        search_terms = ", ".join([f"'{company_name} {v} jobs {location}'" for v in role_variants])
 
-        user_turn = self._log_turn("user", f"Search jobs query: {query}")
+        query = f"""You are a job search specialist. Your objective is to find all current {role} job openings at {company_name} in {location} that are posted today or very recently.
 
-        print(f"🔍 Searching jobs: {query}")
+1) Search for {company_name} {role} jobs posted today in {location} using terms like: {search_terms}
+2) Focus on official {company_name} career pages and major job boards where {company_name} posts positions.
+3) For each job opening found, extract:
+   - Job title
+   - Location (city/state)
+   - Job posting URL/link
+   - Posting date (verify it's recent)
+   - Brief job description or key requirements
+   - Salary range (if listed)
+4) Verify the positions are:
+   a) Actually at {company_name} (not third-party recruiters)
+   b) {role} related
+   c) Located in {location}
+   d) Posted today ({today}) or very recently (within last 7 days)
+
+Return all qualifying job links and details. Prioritize official {company_name} career pages over third-party job boards."""
+
+        print(f"🔍 Searching: {role} at {company_name} in {location}")
+        print(f"📅 Date filter: {today}")
+
         response = self.client.search(
             query=query,
             depth="deep",
@@ -262,9 +210,11 @@ class LinkupJobSearch:
 
     def full_research(self, role: str, company: str, location: str = None, user_query: str | None = None) -> dict:
         """Run the full research pipeline for a job query."""
-        print(f"\n{'='*80}")
-        print(f"🚀 Full Research Pipeline: {role} at {company}")
-        print(f"{'='*80}\n")
+        print(f"\n{'='*60}")
+        print(f"🚀 Full Research: {role} at {company}")
+        print(f"📍 Location: {location}")
+        print(f"📅 Date: {datetime.now().strftime('%B %d, %Y')}")
+        print(f"{'='*60}\n")
 
         query = user_query or self._compose_job_query(role=role, company=company, location=location)
 
@@ -275,8 +225,7 @@ class LinkupJobSearch:
             "recruiters": self.find_recruiters(company, role, query=query),
         }
 
-        # Print summary
-        print(f"\n{'='*80}")
+        print(f"\n{'='*60}")
         print("✅ Research Complete!")
         print(f"{'='*80}")
         for key, value in results.items():
@@ -291,23 +240,37 @@ class LinkupJobSearch:
 # ----- Quick test -----
 if __name__ == "__main__":
     searcher = LinkupJobSearch()
-    formatter = ResultFormatter()
 
-    # Test 1: Simple job search
-    print("\n" + "=" * 80)
-    print("TEST 1: Simple Job Search")
-    print("=" * 80)
-    jobs = searcher.search_jobs("Machine Learning Engineer", company="Amazon", location="USA")
-    formatter.format_results(jobs, max_results=5)
+    # Test: Job search with detailed extraction
+    print("\n" + "=" * 60)
+    print("TEST: Detailed Job Search")
+    print("=" * 60)
 
-    # Test 2: Full pipeline
-    # Uncomment below to run full research (uses 4 API calls)
-    # print("\n\nTEST 2: Full Research Pipeline")
+    jobs = searcher.search_jobs(
+        role="Machine Learning Engineer",
+        company="Amazon",
+        location="United States",
+    )
+
+    print(f"\n📋 Response type: {type(jobs)}")
+    print(f"\n{'='*60}")
+    print("RESULTS:")
+    print(f"{'='*60}")
+
+    # Handle different response formats
+    if hasattr(jobs, "results"):
+        for i, result in enumerate(jobs.results, 1):
+            print(f"\n--- Result {i} ---")
+            print(f"  Title:   {getattr(result, 'name', 'N/A')}")
+            print(f"  URL:     {getattr(result, 'url', 'N/A')}")
+            print(f"  Content: {getattr(result, 'content', 'N/A')[:300]}")
+            print()
+    else:
+        print(jobs)
+
+    # Uncomment to run full pipeline (4 API calls)
     # results = searcher.full_research(
     #     role="Machine Learning Engineer",
-    #     company="Adobe",
-    #     location="USA"
+    #     company="Amazon",
+    #     location="United States",
     # )
-    # for key, val in results.items():
-    #     print(f"\n--- {key} ---")
-    #     formatter.format_results(val, max_results=3)
