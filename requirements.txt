@@ -1,3 +1,5 @@
 # Core dependencies for the agent
 requests
 python-dotenv
+pytest
+typing-extensions
