@@ -203,7 +203,8 @@ class LinkupJobSearch:
             type="company_sentiment",
             content={"query": query, "company": company, "results": self._results_to_storeable(response)},
         )
-        return response
+        # Return the research profile so downstream calls get enriched context
+        return self.company_research_agent.research_profile(company)
 
     def find_recruiters(self, company: str, role: str) -> dict:
         """Find recruiters and hiring managers."""
@@ -267,7 +268,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("TEST 1: Simple Job Search")
     print("=" * 80)
-    jobs = searcher.search_jobs("Senior Software Engineer", company="Zapier", location="USA")
+    jobs = searcher.search_jobs("Machine Learning Engineer", company="Amazon", location="USA")
     formatter.format_results(jobs, max_results=5)
 
     # Test 2: Full pipeline
