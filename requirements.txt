@@ -3,3 +3,4 @@ requests
 python-dotenv
 pytest
 typing-extensions
+linkup
