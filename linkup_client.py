@@ -12,29 +12,12 @@ from company_research_agent import CompanyResearchAgent, JobPostingIntake
 
 load_dotenv()
 
-_DB_INITIALIZED = False
-
-
-def _ensure_db_initialized() -> None:
-    global _DB_INITIALIZED
-    if _DB_INITIALIZED:
-        return
-    memory.init_db()
-    _DB_INITIALIZED = True
-
 
 class LinkupJobSearch:
     def __init__(self, session_id: str | None = None, user_id: str | None = None, api_key: str | None = None):
         api_key = api_key or os.getenv("LINKUP_API_KEY")
         if not api_key:
             raise ValueError("LINKUP_API_KEY not found in .env")
-
-        _ensure_db_initialized()
-        self.user_id = user_id or os.getenv("USER_ID") or "anonymous"
-        memory.register_user(self.user_id)
-        # Reuse a stable session if provided; otherwise default to env or "default"
-        self.session_id = session_id or os.getenv("SESSION_ID") or "default"
-        memory.start_session(user_id=self.user_id, session_id=self.session_id)
         self.client = SDKLinkupClient(api_key=api_key) if SDKLinkupClient else _HTTPLinkupClient(api_key=api_key)
         self.company_research_agent = CompanyResearchAgent(self.client)
 
@@ -115,43 +98,12 @@ Return all qualifying job links and details. Prioritize official {company_name} 
             output_type="searchResults",
             include_images=False,
         )
-
-        self._log_turn("assistant", f"Linkup returned {len(getattr(response, 'results', []) or [])} results for '{query}'")
-        artifact_id = self._log_artifact(
-            type="linkup_research",
-            content={
-                "query": query,
-                "location": location,
-                "company": company,
-                "results": self._results_to_storeable(response),
-            },
-            source_turn_id=user_turn,
-        )
-        if company:
-            self._log_fact(
-                kind="preference",
-                key="target_company",
-                value=company,
-                meta={"source_artifact_id": artifact_id, "title": f"Target company {company}"},
-                source_artifact_id=artifact_id,
-                confidence=0.9,
-            )
-        if role:
-            self._log_fact(
-                kind="preference",
-                key="target_role",
-                value=role,
-                meta={"source_artifact_id": artifact_id, "title": f"Target role {role}"},
-                source_artifact_id=artifact_id,
-                confidence=0.85,
-            )
         return response
 
     def get_company_profile(self, company: str, query: str | None = None) -> dict:
         """Research company background, funding, culture, tech stack."""
         query = query or f"{company} company overview funding tech stack culture engineering team 2025"
 
-        self._log_turn("user", f"Research company profile: {company}")
         print(f"🏢 Researching company: {company}")
         response = self.client.search(
             query=query,
@@ -159,36 +111,18 @@ Return all qualifying job links and details. Prioritize official {company_name} 
             output_type="searchResults",
             include_images=False,
         )
-
-        artifact_id = self._log_artifact(
-            type="company_research",
-            content={"query": query, "company": company, "results": self._results_to_storeable(response)},
-        )
-        self._log_fact(
-            kind="company",
-            key="company_name",
-            value=company,
-            meta={"source_artifact_id": artifact_id, "title": f"Company research for {company}"},
-            confidence=0.75,
-        )
         return self.company_research_agent.research_profile(company)
 
     def get_company_sentiment(self, company: str, query: str | None = None) -> dict:
         """Get employee reviews and sentiment analysis."""
         query = query or f"{company} employee reviews glassdoor engineering culture work life balance"
 
-        self._log_turn("user", f"Analyze sentiment for {company}")
         print(f"💬 Analyzing sentiment: {company}")
         response = self.client.search(
             query=query,
             depth="standard",
             output_type="searchResults",
             include_images=False,
-        )
-
-        self._log_artifact(
-            type="company_sentiment",
-            content={"query": query, "company": company, "results": self._results_to_storeable(response)},
         )
         # Return sentiment analysis report from the dedicated agent
         return self.company_research_agent.research_sentiment(company)
@@ -197,18 +131,12 @@ Return all qualifying job links and details. Prioritize official {company_name} 
         """Find recruiters and hiring managers."""
         query = query or f"{company} recruiter hiring manager {role} LinkedIn"
 
-        self._log_turn("user", f"Find recruiters for {company} - {role}")
         print(f"👤 Finding recruiters: {company} - {role}")
         response = self.client.search(
             query=query,
             depth="standard",
             output_type="searchResults",
             include_images=False,
-        )
-
-        self._log_artifact(
-            type="recruiter_profile",
-            content={"query": query, "company": company, "role": role, "results": self._results_to_storeable(response)},
         )
         return response
 

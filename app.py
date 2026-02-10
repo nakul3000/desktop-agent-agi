@@ -4,9 +4,23 @@
 import os
 import json
 import re
+import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
+
+import memory
+
+# One-time DB init guard
+_DB_INITIALIZED = False
+
+
+def _ensure_db_initialized():
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    memory.init_db()
+    _DB_INITIALIZED = True
 
 load_dotenv()
 
@@ -271,7 +285,7 @@ TOOL_EXECUTORS = {
 # ------------------------------------------------------------------ #
 
 class JobAgent:
-    def __init__(self):
+    def __init__(self, session_id: str | None = None, user_id: str | None = None):
         self.hf_token = os.getenv("HF_TOKEN")
         if not self.hf_token:
             raise ValueError("HF_TOKEN not found in .env")
@@ -281,7 +295,8 @@ class JobAgent:
             raise ValueError("LINKUP_API_KEY not found in .env")
 
         self.client = InferenceClient(
-            model="meta-llama/Llama-3.3-70B-Instruct",
+            # Use a hosted-inference-available model id
+            model="meta-llama/Meta-Llama-3-70B-Instruct",
             token=self.hf_token,
         )
 
@@ -291,6 +306,14 @@ class JobAgent:
             "role": "system",
             "content": SYSTEM_PROMPT,
         })
+
+        # Initialize memory
+        # Derive user/session IDs: prefer explicit args then fallbacks
+        self.user_id = user_id or "anonymous"
+        self.session_id = session_id or str(uuid.uuid4())
+        _ensure_db_initialized()
+        memory.register_user(self.user_id)
+        memory.start_session(user_id=self.user_id, session_id=self.session_id)
 
         # Store context from tool results for downstream use
         self.context_store = {
@@ -308,6 +331,7 @@ class JobAgent:
             "role": "user",
             "content": user_message,
         })
+        memory.store_turn(self.session_id, role="user", text=user_message, user_id=self.user_id)
 
         # Get LLM response
         response = self._call_llm()
@@ -326,10 +350,21 @@ class JobAgent:
 
             # Execute the tool
             if tool_name in TOOL_EXECUTORS:
+                memory.store_turn(self.session_id, role="assistant", text=f"[Tool call planned] {tool_name} {params}", user_id=self.user_id)
                 tool_result = TOOL_EXECUTORS[tool_name](params)
+                tool_turn_id = memory.store_turn(self.session_id, role="tool", text=str(tool_result), user_id=self.user_id, tool_name=tool_name)
 
                 # Store context
                 self._update_context(tool_name, tool_result)
+                # Persist artifact
+                memory.store_artifact(
+                    session_id=self.session_id,
+                    type=tool_name,
+                    content=tool_result,
+                    source_turn_id=tool_turn_id,
+                    created_by="JobAgent",
+                    user_id=self.user_id,
+                )
 
                 # Add tool call + result to conversation history
                 self.conversation_history.append({
@@ -348,6 +383,7 @@ class JobAgent:
                     "role": "assistant",
                     "content": summary,
                 })
+                memory.store_turn(self.session_id, role="assistant", text=summary, user_id=self.user_id)
 
                 return summary
             else:
@@ -356,6 +392,7 @@ class JobAgent:
                     "role": "assistant",
                     "content": error_msg,
                 })
+                memory.store_turn(self.session_id, role="assistant", text=error_msg, user_id=self.user_id)
                 return error_msg
         else:
             # No tool call — natural language response
@@ -363,13 +400,21 @@ class JobAgent:
                 "role": "assistant",
                 "content": response,
             })
+            memory.store_turn(self.session_id, role="assistant", text=response, user_id=self.user_id)
             return response
 
     def _call_llm(self) -> str:
         """Call the HuggingFace Llama model."""
         try:
+            ctx = memory.get_context(self.session_id, user_id=self.user_id)
+            messages = self.conversation_history + [
+                {
+                    "role": "system",
+                    "content": f"Context packet (recent turns/artifacts/facts): {json.dumps(ctx)[:4000]}"
+                }
+            ]
             response = self.client.chat_completion(
-                messages=self.conversation_history,
+                messages=messages,
                 max_tokens=1024,
                 temperature=0.7,
                 top_p=0.9,
