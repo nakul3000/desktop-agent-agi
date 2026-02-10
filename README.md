@@ -1,4 +1,5 @@
 # desktop-agent-agi
+<<<<<<< HEAD
 A repo for hack with DC desktop personal agent.
 This project builds a local-first desktop agent that can search, summarize, and orchestrate tools while keeping a privacy-friendly memory (SQLite) of conversations, artifacts, and facts for better follow-ups.
 
@@ -77,3 +78,4 @@ Required env (see `.env.example`): `LINKUP_API_KEY`. Optional: `HF_TOKEN` (LLM),
 - **Outreach package**: `build_recruiter_outreach_package(role_title=..., job_description=..., resume_text=..., company=..., ...)` returns recruiter info + `email_subject`, `email_body`, and `analysis` (parsed JD and resume). Uses LLM for JD/resume parsing and draft (optional `HF_TOKEN`).
 - **Run examples**: `python run_recruiter_examples.py` (or pass company and role as CLI args). Unit and integration tests: `pytest tests/test_email_handler.py -v`.
 - **Integration**: `AgentCore.handle_message({"intent": "job_outreach", "role_title": ..., "job_description": ..., "resume_text": ..., "company": ...})` calls `build_recruiter_outreach_package` and returns the payload.
+ 
