@@ -43,7 +43,7 @@ class EmailHandler:
     ]
     HF_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 
-    def __init__(self, hf_token: str, credentials_path: str = 'credentials.json', token_path: str = 'token.json'):
+    def __init__(self, hf_token: str, credentials_path: str = 'credentials.json', token_path: str = 'gmail_token.json'):
         self.hf_token = hf_token
         # Allow overriding model name (including provider suffix) via env var.
         # Examples:
@@ -934,7 +934,16 @@ if __name__ == "__main__":
     # 1. Configuration
     HF_TOKEN = os.getenv("HF_TOKEN")
     if not HF_TOKEN:
-        print("ERROR: Please set HF_TOKEN environment variable.")
+        # Optional fallback: read from local token.json (not the Gmail OAuth token file).
+        try:
+            with open("token.json", "r") as f:
+                data = json.load(f) or {}
+            HF_TOKEN = data.get("hf_token") or data.get("HF_TOKEN") or data.get("token")
+        except Exception:
+            HF_TOKEN = None
+
+    if not HF_TOKEN:
+        print("ERROR: Please set HF_TOKEN environment variable or add {\"hf_token\": \"...\"} to token.json.")
         exit(1)
         
     # Initialize
