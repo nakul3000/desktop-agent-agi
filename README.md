@@ -2,6 +2,30 @@
 A repo for hack with DC desktop personal agent.
 This project builds a local-first desktop agent that can search, summarize, and orchestrate tools while keeping a privacy-friendly memory (SQLite) of conversations, artifacts, and facts for better follow-ups.
 
+## Setup
+
+Install dependencies (use the same Python you run the app with):
+
+```bash
+pip install -r requirements.txt
+```
+
+If your default `pip` is broken (e.g. SyntaxError inside pip’s truststore), use a specific Python or a venv:
+
+```bash
+# Option A: Use Python 3.11 explicitly (if installed)
+python3.11 -m pip install -r requirements.txt
+python3.11 -m pytest tests/test_email_handler.py -v
+
+# Option B: Create a venv with a working Python, then install
+python3.11 -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+pytest tests/test_email_handler.py -v
+```
+
+Required env (see `.env.example`): `LINKUP_API_KEY`. Optional: `HF_TOKEN` (LLM), Gmail credentials for email features.
+
 ## Packaging notes
 - This repo currently ships without a `pyproject.toml` or `setup.py`. Use `requirements.txt` for dependencies or add your own packaging config if you need installs.
 
@@ -38,3 +62,18 @@ This project builds a local-first desktop agent that can search, summarize, and 
   3) `artifact_id = memory.store_artifact(session, "doc_summary", {"title": "...", "content": "..."})`
   4) `fact_id = memory.store_fact(session, "deadline", "response_deadline", "2026-02-15", meta={"title": "Respond to ..."})`
   5) If embeddings installed, create `EmbeddingIndex` and add text using `prepare_text_for_embedding(content)`.
+
+## Email handler
+
+### Explanation - What it does
+- **Recruiter lookup**: Finds recruiter contact details (name, title, email, LinkedIn) for a given company and role using the Linkup API. Uses a structured schema to request multiple contacts per query, scrapes emails and LinkedIn URLs from responses, and deduplicates by name.
+- **Quality filters**: Rejects placeholder emails (e.g. `z@company.com`, `first.last@company.com`, `f.last@`), reply relays and marketing domains (e.g. `reply-xxx@reply.s12.y.mc.salesf`), and free-provider addresses when a corporate domain is expected. Prefers same-company contacts over agency/third-party when sorting.
+- **Outreach package**: End-to-end flow for job outreach: parse job description and resume, find recruiter contacts via Linkup, draft a personalized outreach email (subject + body). Used by `AgentCore` for the `job_outreach` intent.
+- **Gmail integration**: Optional. Read and parse emails, summarize threads, extract deadlines/tasks/entities, draft replies. Requires Google OAuth (`credentials.json` + `token.json`).
+
+### Files and usage
+- **File**: `email_handler.py` — `EmailHandler` class.
+- **Recruiter lookup**: `find_recruiter_contact(company=..., role_title=..., team_or_domain=..., min_emails=3)` returns `{ "name", "title", "email", "emails", "linkedin_urls", "contacts", "confidence", "fallback_suggestion" }`. Requires `LINKUP_API_KEY`.
+- **Outreach package**: `build_recruiter_outreach_package(role_title=..., job_description=..., resume_text=..., company=..., ...)` returns recruiter info + `email_subject`, `email_body`, and `analysis` (parsed JD and resume). Uses LLM for JD/resume parsing and draft (optional `HF_TOKEN`).
+- **Run examples**: `python run_recruiter_examples.py` (or pass company and role as CLI args). Unit and integration tests: `pytest tests/test_email_handler.py -v`.
+- **Integration**: `AgentCore.handle_message({"intent": "job_outreach", "role_title": ..., "job_description": ..., "resume_text": ..., "company": ...})` calls `build_recruiter_outreach_package` and returns the payload.
