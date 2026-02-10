@@ -2,7 +2,11 @@
 import os
 from datetime import datetime
 from dotenv import load_dotenv
-from linkup import LinkupClient
+try:
+    # SDK variant used in some Linkup versions
+    from linkup import LinkupClient as SDKLinkupClient
+except Exception:
+    SDKLinkupClient = None
 
 from company_research_agent import CompanyResearchAgent, JobPostingIntake
 
@@ -20,8 +24,8 @@ def _ensure_db_initialized() -> None:
 
 
 class LinkupJobSearch:
-    def __init__(self, session_id: str | None = None, user_id: str | None = None):
-        api_key = os.getenv("LINKUP_API_KEY")
+    def __init__(self, session_id: str | None = None, user_id: str | None = None, api_key: str | None = None):
+        api_key = api_key or os.getenv("LINKUP_API_KEY")
         if not api_key:
             raise ValueError("LINKUP_API_KEY not found in .env")
 
@@ -31,7 +35,7 @@ class LinkupJobSearch:
         # Reuse a stable session if provided; otherwise default to env or "default"
         self.session_id = session_id or os.getenv("SESSION_ID") or "default"
         memory.start_session(user_id=self.user_id, session_id=self.session_id)
-        self.client = LinkupClient(api_key=api_key)
+        self.client = SDKLinkupClient(api_key=api_key) if SDKLinkupClient else _HTTPLinkupClient(api_key=api_key)
         self.company_research_agent = CompanyResearchAgent(self.client)
 
     def build_job_intake(self, selected_jd_payload: dict) -> JobPostingIntake:
@@ -235,6 +239,11 @@ Return all qualifying job links and details. Prioritize official {company_name} 
                 print(f"  📄 {key}: {type(value).__name__}")
 
         return results
+
+
+# Compatibility wrapper for app.py imports.
+class LinkupClient(LinkupJobSearch):
+    pass
 
 
 # ----- Quick test -----

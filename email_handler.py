@@ -42,17 +42,36 @@ class EmailHandler:
         "https://api-inference.huggingface.co/v1/chat/completions",
     ]
     HF_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+    LINKUP_API_URL = "https://api.linkup.so/v1/search"
 
-    def __init__(self, hf_token: str, credentials_path: str = 'credentials.json', token_path: str = 'gmail_token.json'):
-        self.hf_token = hf_token
+    def __init__(
+        self,
+        hf_token: Optional[str] = None,
+        credentials_path: str = 'credentials.json',
+        token_path: str = 'token.json',
+        auto_authenticate_gmail: bool = False,
+    ):
+        self.hf_token = hf_token or os.getenv("HF_TOKEN", "")
         # Allow overriding model name (including provider suffix) via env var.
         # Examples:
         #   export HF_MODEL="meta-llama/Llama-3.3-70B-Instruct"
         #   export HF_MODEL="meta-llama/Llama-3.3-70B-Instruct:fireworks-ai"
         self.hf_model = os.getenv("HF_MODEL", self.HF_MODEL)
+        self.linkup_api_key = os.getenv("LINKUP_API_KEY", "")
         self.creds = None
         self.service = None
-        self._authenticate_gmail(credentials_path, token_path)
+        self.credentials_path = credentials_path
+        self.token_path = token_path
+        if auto_authenticate_gmail:
+            self._authenticate_gmail(credentials_path, token_path)
+
+    def connect_gmail(self) -> bool:
+        """
+        Explicitly authenticate Gmail when the orchestrator decides it's needed.
+        Returns True when Gmail service is ready.
+        """
+        self._authenticate_gmail(self.credentials_path, self.token_path)
+        return self.service is not None
 
     def _authenticate_gmail(self, creds_path: str, token_path: str):
         """
@@ -260,6 +279,75 @@ class EmailHandler:
         if not s:
             return ""
         return s if len(s) <= limit else s[:limit]
+
+    def _call_linkup_structured(self, *, query: str, schema: Dict[str, Any], depth: str = "deep") -> Dict[str, Any]:
+        """
+        Calls Linkup /v1/search using structured output.
+        Returns parsed JSON dict when successful.
+        """
+        if not self.linkup_api_key:
+            return {"error": "Missing LINKUP_API_KEY"}
+
+        headers = {
+            "Authorization": f"Bearer {self.linkup_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "q": query,
+            "depth": depth,
+            "outputType": "structured",
+            "structuredOutputSchema": json.dumps(schema),
+            "includeSources": False,
+            "includeImages": False,
+            "includeInlineCitations": False,
+            "maxResults": 6,
+        }
+        try:
+            resp = requests.post(self.LINKUP_API_URL, headers=headers, json=payload, timeout=60)
+            resp.raise_for_status()
+            out = resp.json()
+            if isinstance(out, dict):
+                return out
+            return {"raw": out}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @staticmethod
+    def _company_domain_hint(company: str) -> str:
+        name = (company or "").strip().lower()
+        if name in {"google", "alphabet"}:
+            return "google.com"
+        if name in {"meta", "facebook"}:
+            return "meta.com"
+        if name in {"microsoft"}:
+            return "microsoft.com"
+        if name in {"amazon", "aws"}:
+            return "amazon.com"
+        return ""
+
+    def _looks_like_corporate_email(self, email: str, company: str) -> bool:
+        if not email or "@" not in email:
+            return False
+        domain = email.split("@", 1)[1].lower()
+        hint = self._company_domain_hint(company)
+        if hint and domain.endswith(hint):
+            return True
+        if domain.endswith(("gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "proton.me", "protonmail.com")):
+            return False
+        return True
+
+    @staticmethod
+    def _is_full_email(email: str) -> bool:
+        """
+        Accept only complete, non-obfuscated emails.
+        Reject masked forms like d***@google.com.
+        """
+        if not email:
+            return False
+        e = email.strip()
+        if "*" in e:
+            return False
+        return re.fullmatch(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", e, flags=re.IGNORECASE) is not None
 
     # ==========================
     # 1. READ & PARSE EMAILS
@@ -732,6 +820,245 @@ class EmailHandler:
     # JOB SEARCH / APPLY HELPERS
     # ==========================
 
+    def parse_job_description(self, *, role_title: str, company: str, job_description: str) -> Dict[str, Any]:
+        """
+        Extract role understanding from JD:
+        - role title
+        - team/domain
+        - required skills
+        - team priorities
+        """
+        prompt = (
+            "Extract structured understanding from this job description.\n"
+            "Return VALID JSON ONLY with keys:\n"
+            '{ "role_title": string, "company": string, "team_or_domain": string, '
+            '"required_skills": [string], "what_the_team_cares_about": [string] }\n\n'
+            "Rules:\n"
+            "- Do not invent details not present.\n"
+            "- team_or_domain should be concise (e.g. ML Infra, GenAI, Search, Ads).\n"
+            "- required_skills should be 5-12 items.\n"
+            "- what_the_team_cares_about should be 3-6 short bullets.\n\n"
+            f"Company: {company}\n"
+            f"Role title (provided): {role_title}\n\n"
+            f"JOB DESCRIPTION:\n{self._truncate(job_description, 9000)}"
+        )
+        raw = self._call_llm(prompt, "You are a strict information extraction system. Output JSON only.")
+        parsed = self._safe_json_from_llm(raw)
+        if parsed:
+            return parsed
+        return {
+            "role_title": role_title,
+            "company": company,
+            "team_or_domain": "",
+            "required_skills": [],
+            "what_the_team_cares_about": [],
+            "raw": raw,
+        }
+
+    def parse_resume(self, *, resume_text: str) -> Dict[str, Any]:
+        """
+        Extract candidate understanding from resume:
+        - core skills
+        - relevant experiences
+        - years of experience (if inferable)
+        """
+        prompt = (
+            "Extract structured understanding from this resume.\n"
+            "Return VALID JSON ONLY with keys:\n"
+            '{ "core_skills": [string], "years_experience": number|null, '
+            '"most_relevant_experiences": [{"title": string, "summary": string, "skills": [string]}] }\n\n'
+            "Rules:\n"
+            "- Be conservative; use null if years are unclear.\n"
+            "- Select 2-4 most relevant experiences.\n"
+            "- Do not invent employers/projects.\n\n"
+            f"RESUME:\n{self._truncate(resume_text, 9000)}"
+        )
+        raw = self._call_llm(prompt, "You are a strict information extraction system. Output JSON only.")
+        parsed = self._safe_json_from_llm(raw)
+        if parsed:
+            return parsed
+        return {
+            "core_skills": [],
+            "years_experience": None,
+            "most_relevant_experiences": [],
+            "raw": raw,
+        }
+
+    def find_recruiter_contact(
+        self,
+        *,
+        company: str,
+        role_title: str,
+        team_or_domain: str = "",
+        min_emails: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Use Linkup to find recruiter contact details.
+        Returns:
+          {
+            "name": "...",
+            "email": "...",
+            "emails": ["..."],
+            "contacts": [{"name","email","confidence","source"}],
+            "confidence": "high|medium|low",
+            "source": "...",
+            "fallback_suggestion": "..."
+          }
+        """
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Recruiter full name if found, else empty string"},
+                "email": {"type": "string", "description": "Recruiter email address if found, else empty string"},
+                "confidence": {"type": "string", "description": "high, medium, or low"},
+                "source": {"type": "string", "description": "Source URL or source note"},
+                "fallback_suggestion": {"type": "string", "description": "Suggestion if no valid email found"},
+            },
+            "required": ["name", "email", "confidence", "source", "fallback_suggestion"],
+        }
+
+        domain = self._company_domain_hint(company)
+        # Tier 1: role-specific queries (best match)
+        role_specific_queries = [
+            f"{company} {role_title} recruiter email",
+            f"{company} machine learning recruiter contact email",
+            f"{company} hiring recruiter {team_or_domain} email",
+            f"{company} talent acquisition email {role_title}",
+        ]
+        # Tier 2: broader recruiting contact fallback when role-specific fails
+        broad_fallback_queries = [
+            f"{company} recruiter email",
+            f"{company} talent acquisition email",
+            f"{company} university recruiting email",
+            f"{company} careers contact email",
+            f"{company} hr contact email",
+        ]
+
+        best = {
+            "name": "",
+            "email": "",
+            "emails": [],
+            "contacts": [],
+            "confidence": "low",
+            "source": "",
+            "fallback_suggestion": "",
+        }
+        best_name = ""
+        best_source = ""
+        best_conf = "low"
+        # Collect multiple unique emails so we can return at least top 3 when available.
+        collected_contacts: List[Dict[str, str]] = []
+        seen_emails = set()
+
+        conf_rank = {"low": 0, "medium": 1, "high": 2}
+
+        def search_queries(queries: List[str], *, tier: str) -> None:
+            nonlocal best, best_name, best_source, best_conf, collected_contacts, seen_emails
+            for q in queries:
+                out = self._call_linkup_structured(query=q, schema=schema, depth="deep")
+                if out.get("error"):
+                    continue
+
+                name = str(out.get("name") or "").strip()
+                email = str(out.get("email") or "").strip()
+                conf = str(out.get("confidence") or "low").lower().strip()
+                source = str(out.get("source") or "").strip()
+                fallback = str(out.get("fallback_suggestion") or "").strip()
+                if conf not in {"high", "medium", "low"}:
+                    conf = "low"
+
+                # Extract email if model put it elsewhere.
+                if not email:
+                    blob = json.dumps(out)
+                    m = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", blob, re.IGNORECASE)
+                    if m:
+                        email = m.group(0)
+
+                # Save recruiter identity even when email is missing, for fallback outreach.
+                if name and not best_name:
+                    best_name = name
+                if source and not best_source:
+                    best_source = source
+                if conf in {"high", "medium"} and best_conf == "low":
+                    best_conf = conf
+
+                # Accept only complete, non-masked emails for downstream use.
+                if email and self._is_full_email(email) and self._looks_like_corporate_email(email, company):
+                    email_l = email.lower()
+                    if email_l not in seen_emails:
+                        seen_emails.add(email_l)
+                        collected_contacts.append(
+                            {
+                                "name": name,
+                                "email": email,
+                                "confidence": conf,
+                                "source": source,
+                            }
+                        )
+
+                    # Keep a single "best" contact for backward compatibility.
+                    if (
+                        not best.get("email")
+                        or conf_rank.get(conf, 0) > conf_rank.get(str(best.get("confidence", "low")), 0)
+                    ):
+                        best = {
+                            "name": name,
+                            "email": email,
+                            "emails": [c["email"] for c in collected_contacts],
+                            "contacts": collected_contacts,
+                            "confidence": conf,
+                            "source": source,
+                            "fallback_suggestion": fallback,
+                        }
+
+                    # Stop early only if we already reached target email count in role-specific tier.
+                    if tier == "role_specific" and len(collected_contacts) >= max(min_emails, 1):
+                        return
+
+                elif fallback and not best.get("fallback_suggestion"):
+                    best["fallback_suggestion"] = fallback
+
+        # First try role-specific recruiter contact.
+        search_queries(role_specific_queries, tier="role_specific")
+
+        # If no valid role-specific email, broaden search to generic recruiting contacts.
+        if len(collected_contacts) < max(min_emails, 1):
+            search_queries(broad_fallback_queries, tier="broad_fallback")
+
+        # Finalize aggregated emails/contacts sorted by confidence then stable order.
+        if collected_contacts:
+            collected_contacts.sort(key=lambda c: conf_rank.get(str(c.get("confidence", "low")), 0), reverse=True)
+            top_contacts = collected_contacts[: max(min_emails, 1)]
+            emails = [c["email"] for c in top_contacts]
+            best["contacts"] = top_contacts
+            best["emails"] = emails
+            # Keep primary fields compatible with prior output shape.
+            best["email"] = emails[0]
+            if not best.get("name"):
+                best["name"] = top_contacts[0].get("name", "")
+            if not best.get("source"):
+                best["source"] = top_contacts[0].get("source", "")
+            if not best.get("confidence"):
+                best["confidence"] = top_contacts[0].get("confidence", "medium")
+            return best
+
+        if not best.get("email"):
+            best["name"] = best_name
+            best["source"] = best_source
+            best["confidence"] = "low" if not best_name else best_conf
+            best["emails"] = []
+            best["contacts"] = []
+            best["fallback_suggestion"] = (
+                best.get("fallback_suggestion")
+                or (
+                    f"No public full recruiter email found. Use recruiting@{domain} if available, "
+                    f"or send LinkedIn outreach to {company} recruiters."
+                    if domain
+                    else f"No public full recruiter email found. Use LinkedIn outreach to {company} recruiters."
+                )
+            )
+        return best
+
     def build_job_fit_profile(
         self,
         *,
@@ -835,6 +1162,8 @@ class EmailHandler:
             "- Subject: <= 78 chars.\n"
             "- Body: 90-160 words.\n"
             "- 1 short intro line, 2-3 fit highlights (bullets allowed), 1 clear ask, polite close.\n"
+            "- Write from the CANDIDATE to the recruiter (first-person as candidate).\n"
+            "- Do NOT write as the recruiter.\n"
             "- Do not claim referrals unless explicitly stated.\n"
             "- Use the job URL/ID if provided.\n\n"
             f"Company: {company}\n"
@@ -858,12 +1187,110 @@ class EmailHandler:
         subject = (parsed.get("subject") or "").strip()
         body = (parsed.get("body") or "").strip()
 
+        # Some models return nested JSON or fenced blocks inside "body".
+        # Attempt one more pass to unwrap nested {"subject","body"} payloads.
+        if body:
+            nested = self._safe_json_from_llm(body)
+            if nested:
+                nested_subject = (nested.get("subject") or "").strip()
+                nested_body = (nested.get("body") or "").strip()
+                if nested_subject and not subject:
+                    subject = nested_subject
+                if nested_body:
+                    body = nested_body
+
+        # Strip markdown fences if any remain.
+        if body.startswith("```"):
+            body = body.replace("```json", "").replace("```", "").strip()
+
+        # If body still looks like a JSON object string, try extracting "body" field robustly.
+        body_candidate = body.strip()
+        if body_candidate.startswith("{") and body_candidate.endswith("}"):
+            try:
+                obj = json.loads(body_candidate)
+                if isinstance(obj, dict) and isinstance(obj.get("body"), str):
+                    body = obj["body"].strip()
+                    if isinstance(obj.get("subject"), str) and not subject:
+                        subject = obj["subject"].strip()
+            except Exception:
+                # Best-effort fallback for loosely valid JSON-like strings
+                m = re.search(r'"body"\s*:\s*"(.+?)"\s*(?:,|\})', body_candidate, re.DOTALL)
+                if m:
+                    extracted = m.group(1)
+                    # Unescape common JSON escapes for readability.
+                    extracted = extracted.replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t")
+                    body = extracted.strip()
+
         # Fallback: if model didn't comply, return raw as body.
         if not subject and not body:
             return {"subject": f"Interest in {role_title} at {company}", "body": raw.strip()}
         if not subject:
             subject = f"Interest in {role_title} at {company}"
         return {"subject": subject, "body": body}
+
+    def build_recruiter_outreach_package(
+        self,
+        *,
+        role_title: str,
+        job_description: str,
+        resume_text: str,
+        company: str,
+        preferred_tone: str = "formal",
+        candidate_name: str = "",
+        candidate_location: str = "",
+        candidate_linkedin: str = "",
+        candidate_portfolio: str = "",
+        additional_context: str = "",
+    ) -> Dict[str, Any]:
+        """
+        End-to-end flow for this responsibility:
+        1) Parse JD
+        2) Parse Resume
+        3) Find recruiter email via Linkup
+        4) Draft personalized outreach email
+
+        Output:
+        {
+          "recruiter": {"name","email","confidence"},
+          "email_subject": "...",
+          "email_body": "...",
+          "analysis": {"jd":..., "resume":...}
+        }
+        """
+        jd = self.parse_job_description(role_title=role_title, company=company, job_description=job_description)
+        resume = self.parse_resume(resume_text=resume_text)
+        recruiter = self.find_recruiter_contact(
+            company=company,
+            role_title=role_title,
+            team_or_domain=str(jd.get("team_or_domain", "")),
+        )
+
+        tone = "professional" if preferred_tone.lower() == "formal" else "friendly"
+        draft = self.draft_recruiter_outreach_email(
+            role_title=role_title,
+            company=company,
+            recruiter_name=recruiter.get("name", ""),
+            job_description=job_description,
+            resume_text=resume_text,
+            candidate_name=candidate_name,
+            candidate_location=candidate_location,
+            candidate_linkedin=candidate_linkedin,
+            candidate_portfolio=candidate_portfolio,
+            additional_context=additional_context,
+            tone=tone,
+        )
+
+        return {
+            "recruiter": {
+                "name": recruiter.get("name", ""),
+                "email": recruiter.get("email", ""),
+                "emails": recruiter.get("emails", []),
+                "confidence": recruiter.get("confidence", "low"),
+            },
+            "email_subject": draft.get("subject", ""),
+            "email_body": draft.get("body", ""),
+            "analysis": {"jd": jd, "resume": resume},
+        }
 
     def draft_recruiter_follow_up(
         self,
