@@ -4,3 +4,9 @@ python-dotenv
 pytest
 typing-extensions
 linkup
+beautifulsoup4
+python-dateutil
+# Gmail API (used by email_handler)
+google-auth
+google-auth-oauthlib
+google-api-python-client
