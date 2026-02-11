@@ -18,11 +18,13 @@ from dotenv import load_dotenv
 
 _SDK_IMPORT_ERROR: Exception | None = None
 try:
-    # SDK variant used in some Linkup versions
-    from linkup import LinkupClient as SDKLinkupClient
-except Exception as e:
-    _SDK_IMPORT_ERROR = e
-    SDKLinkupClient = None
+    from linkup_sdk import LinkupClient as SDKLinkupClient  # ✅ correct SDK
+except Exception:
+    try:
+        from linkup import LinkupClient as SDKLinkupClient  # fallback (often wrong package)
+    except Exception as e:
+        _SDK_IMPORT_ERROR = e
+        SDKLinkupClient = None
 
 from company_research_agent import CompanyResearchAgent, JobPostingIntake
 
@@ -651,6 +653,64 @@ Return all qualifying job links and details. Prioritize official {company_name} 
                 print(f"  📄 {key}: {type(value).__name__}")
 
         return results
+
+# ------------------------------------------------------------------ #
+# Convenience functional wrapper (used by agents)
+# ------------------------------------------------------------------ #
+
+_client_singleton: Any = None
+
+
+def linkup_search(
+    *,
+    query: str,
+    depth: str = "standard",
+    output_type: str = "searchResults",
+    max_results: int = 10,
+    include_images: bool = False,
+    schema: Any = None,
+) -> Any:
+    """
+    Lightweight functional wrapper used by agents (e.g., resume_tailor_agent).
+    Keeps agent code decoupled from LinkupJobSearch internals.
+
+    Note:
+    - Some SDK versions may not support include_images/schema — we keep args for compatibility.
+    """
+    global _client_singleton
+
+    # Create once
+    if _client_singleton is None:
+        # Prefer direct SDK client if available (fast path)
+        if SDKLinkupClient is not None:
+            api_key = os.getenv("LINKUP_API_KEY")
+            if not api_key:
+                raise ValueError("LINKUP_API_KEY not found in .env")
+            _client_singleton = SDKLinkupClient(api_key=api_key)
+        else:
+            # Fall back to your existing HTTP fallback class (will fail fast with a clear message)
+            api_key = os.getenv("LINKUP_API_KEY")
+            if not api_key:
+                raise ValueError("LINKUP_API_KEY not found in .env")
+            _client_singleton = _HTTPLinkupClient(api_key=api_key)
+
+    # Call the SDK search. Keep kwargs minimal for broad SDK compatibility.
+    kwargs = {
+        "query": query,
+        "depth": depth,
+        "output_type": output_type,
+    }
+
+    # If your SDK supports max_results, pass it; if not, this will error → adjust once confirmed.
+    # (Most linkup-sdk versions accept max_results.)
+    kwargs["max_results"] = max_results
+
+    # include_images + schema are kept for compatibility but not always supported.
+    # Only pass them if you know your SDK version supports them.
+    # kwargs["include_images"] = include_images
+    # kwargs["structured_output_schema"] = schema
+
+    return _client_singleton.search(**kwargs)
 
 
 # Compatibility wrapper for app.py imports.

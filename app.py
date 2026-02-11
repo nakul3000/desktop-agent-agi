@@ -17,7 +17,9 @@ except ModuleNotFoundError:
 
 import memory
 from linkup_client import LinkupJobSearch, normalize_search_results_to_jobs
-from utils import load_resume_from_env
+from agents.resume_tailor_agent import TailorRequest, tailor_resume
+
+# from utils import load_resume_from_env
 
 # One-time DB init guard
 _DB_INITIALIZED = False
@@ -409,29 +411,91 @@ def execute_company_profiler(params: dict) -> str:
 
 
 def execute_resume_tailor(params: dict) -> str:
-    """Tailor resume for a specific role"""
-    role = params.get("role", "")
-    company = params.get("company", "")
-    jd = params.get("job_description", "")
+    """
+    Real resume tailoring using agents.resume_tailor_agent.
+    Requires RESUME_PATH in .env (or pass params.resume_path).
+    Uses selected job's JD (context.selected_job.jd_text) if available.
+    """
+    try:
+        context = params.get("context") or {}
+        selected_job = (context.get("selected_job") or {}) if isinstance(context, dict) else {}
 
-    return json.dumps({
-        "status": "success",
-        "role": role,
-        "company": company,
-        "tailored_sections": {
-            "headline": f"{role} | ML Systems | Production AI at Scale",
-            "summary": f"Applied ML Scientist with production experience building AI systems serving 150K+ users. Seeking {role} role at {company}.",
-            "key_skills_highlighted": [
-                "RAG systems & retrieval pipelines",
-                "Production ML (sub-3s latency, 150K+ users)",
-                "LLM evaluation & benchmarking (RAGAS)",
-                "Python, PyTorch, LangChain",
-            ],
-            "bullets_rewritten": 3,
-            "keywords_matched": ["machine learning", "production", "RAG", "LLM", "Python"],
-        },
-        "next_steps": "Want me to also generate a cover letter or draft an outreach email?",
-    }, indent=2)
+        # 1) Resume path (required)
+        resume_path = (params.get("resume_path") or os.getenv("RESUME_PATH") or "").strip()
+        if not resume_path:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "Missing RESUME_PATH. Add RESUME_PATH=/absolute/path/to/resume.pdf in .env "
+                             "or pass { resume_path: ... } in tool parameters.",
+                },
+                indent=2,
+            )
+
+        # 2) Job description text (required)
+        jd_text = ""
+        if isinstance(selected_job, dict):
+            jd_text = (selected_job.get("jd_text") or "").strip()
+
+        # fallback: tool param
+        if not jd_text:
+            jd_text = (params.get("job_description") or "").strip()
+
+        if not jd_text:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "Missing job description text. Select a job first (so jd_text is captured) "
+                             "or pass job_description in the tool call.",
+                },
+                indent=2,
+            )
+
+        # 3) Metadata (optional)
+        job_title = (params.get("role") or selected_job.get("title") or "").strip() or None
+        company = (params.get("company") or selected_job.get("company") or "").strip() or None
+        location = (params.get("location") or selected_job.get("location") or "").strip() or None
+
+        # 4) Output paths (optional but recommended)
+        out_dir = Path("outputs")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        output_docx_path = (params.get("output_docx_path") or str(out_dir / "tailored_resume.docx")).strip()
+        output_pdf_path = (params.get("output_pdf_path") or str(out_dir / "tailored_resume_ats.pdf")).strip()
+
+        req = TailorRequest(
+            resume_path=resume_path,
+            job_description=jd_text,
+            job_title=job_title,
+            company=company,
+            location=location,
+            output_docx_path=output_docx_path,
+            output_pdf_path=output_pdf_path,
+        )
+
+        result = tailor_resume(req)
+
+        # Ensure we return a JSON string (your app expects this)
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        error_type = type(e).__name__
+        tb_text = traceback.format_exc().rstrip()
+        print(f"\n{'=' * 80}")
+        print("❌ ERROR LOG: resume_tailor failed")
+        print(f"Type: {error_type}")
+        print(f"Message: {e}")
+        print("Traceback:")
+        print(tb_text)
+        print(f"{'=' * 80}\n")
+        return json.dumps(
+            {
+                "status": "error",
+                "error": str(e),
+                "error_type": error_type,
+            },
+            indent=2,
+        )
 
 
 def execute_cover_letter_generator(params: dict) -> str:
@@ -552,7 +616,7 @@ class JobAgent:
         self.awaiting_jd_text = False
 
         # Best-effort: load resume text for downstream stubs/agents.
-        self.context_store["user_resume"] = load_resume_from_env() or None
+        self.context_store["user_resume"] = None
 
     def _build_context_envelope(self, *, user_request: str) -> dict:
         selected_job = self.context_store.get("selected_job") or {}
@@ -1039,7 +1103,10 @@ class JobAgent:
                 temperature=0.7,
                 top_p=0.9,
             )
-            return response.choices[0].message.content.strip()
+            text = response.choices[0].message.content.strip()
+            memory.store_turn(self.session_id, role="assistant", text=text, user_id=self.user_id)
+            memory.store_artifact(self.session_id, "llm_response", text, user_id=self.user_id)
+            return text
         except Exception as e:
             err = str(e)
 

@@ -4,8 +4,6 @@ Memory store for desktop agent demo.
 Currently provides:
 - SQLite schema creation via `init_db`.
 - Connection helpers with consistent row factory and ISO timestamps.
-
-Embeddings/semantic recall will live in `embeddings.py`.
 """
 
 from __future__ import annotations
@@ -131,20 +129,6 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         """
     )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS embeddings_map (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            user_id TEXT,
-            item_type TEXT NOT NULL,
-            item_id INTEGER NOT NULL,
-            text_for_embedding TEXT NOT NULL,
-            timestamp TEXT NOT NULL
-        );
-        """
-    )
-
     conn.commit()
 
     # Backfill helper: add user_id column if table pre-exists without it
@@ -154,7 +138,7 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         if column not in cols:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type};")
 
-    for tbl in ("turns", "artifacts", "facts", "refs", "embeddings_map"):
+    for tbl in ("turns", "artifacts", "facts", "refs"):
         _ensure_column(tbl, "user_id", "TEXT")
     # Ensure tool_name exists on turns
     _ensure_column("turns", "tool_name", "TEXT")
@@ -431,3 +415,41 @@ __all__ = [
     "register_user",
     "start_session",
 ]
+# ------------------------------------------------------------------ #
+# OO wrapper for compatibility with code that expects `Memory()`
+# ------------------------------------------------------------------ #
+
+class Memory:
+    """
+    Lightweight wrapper around the functional memory module.
+
+    This exists for compatibility with components (e.g., AgentCore/app.py)
+    that expect a Memory object rather than free functions.
+    """
+
+    def __init__(self, db_path: Optional[Union[str, Path]] = None):
+        self.db_path = db_path
+        init_db(db_path=db_path)
+
+    def register_user(self, user_id: str, name: Optional[str] = None, email: Optional[str] = None, meta: Optional[dict] = None) -> int:
+        return register_user(user_id=user_id, name=name, email=email, meta=meta, db_path=self.db_path)
+
+    def start_session(self, user_id: Optional[str] = None, session_id: Optional[str] = None) -> str:
+        return start_session(user_id=user_id, session_id=session_id, db_path=self.db_path)
+
+    def store_turn(self, session_id: str, role: str, text: str, user_id: Optional[str] = None, tool_name: Optional[str] = None) -> int:
+        return store_turn(session_id=session_id, role=role, text=text, user_id=user_id, tool_name=tool_name, db_path=self.db_path)
+
+    def store_artifact(self, session_id: str, type: str, content: str, source_turn_id: Optional[int] = None, created_by: Optional[str] = None, user_id: Optional[str] = None) -> int:
+        return store_artifact(
+            session_id=session_id,
+            type=type,
+            content=content,
+            source_turn_id=source_turn_id,
+            created_by=created_by,
+            user_id=user_id,
+            db_path=self.db_path,
+        )
+
+    def get_context(self, session_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+        return get_context(session_id=session_id, user_id=user_id, db_path=self.db_path)
