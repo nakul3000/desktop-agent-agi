@@ -7,7 +7,10 @@ Thin wrapper around LinkUp search plus helper normalization utilities.
 import os
 import re
 import sys
+import json
 import traceback
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -31,6 +34,180 @@ def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
         return getattr(obj, name)
     except Exception:
         return default
+
+
+def _canonicalize_url(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        scheme = parsed.scheme.lower() or "https"
+        netloc = parsed.netloc.lower()
+        path = (parsed.path or "/").rstrip("/") or "/"
+        return urllib.parse.urlunparse((scheme, netloc, path, "", "", ""))
+    except Exception:
+        return raw
+
+
+def _extract_visible_text_from_html(html: str) -> str:
+    if not html:
+        return ""
+    cleaned = re.sub(r"(?is)<(script|style|noscript|svg|iframe).*?>.*?</\1>", " ", html)
+    cleaned = re.sub(r"(?is)<br\s*/?>", "\n", cleaned)
+    cleaned = re.sub(r"(?is)</(p|div|li|h1|h2|h3|h4|h5|h6|section|article|tr)>", "\n", cleaned)
+    cleaned = re.sub(r"(?is)<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"[ \t\r\f\v]+", " ", cleaned)
+    cleaned = re.sub(r"\n\s+\n", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _extract_text_from_embedded_json(html: str) -> str:
+    """
+    Extract job-relevant text from embedded JSON payloads (JSON-LD, Next.js blobs, etc.).
+    This helps with pages that hydrate content from script tags.
+    """
+    if not html:
+        return ""
+
+    script_chunks: List[str] = []
+    script_re = re.compile(
+        r"(?is)<script[^>]*?(?:type\s*=\s*[\"']application/(?:ld\+)?json[\"'][^>]*)?>(.*?)</script>"
+    )
+    for m in script_re.finditer(html):
+        chunk = (m.group(1) or "").strip()
+        if not chunk:
+            continue
+        # Skip obvious JavaScript code blobs; keep JSON-like chunks.
+        if not (chunk.startswith("{") or chunk.startswith("[")):
+            continue
+        script_chunks.append(chunk)
+
+    if not script_chunks:
+        return ""
+
+    key_weights = {
+        "description": 8,
+        "jobdescription": 8,
+        "responsibilities": 7,
+        "requirements": 7,
+        "qualifications": 7,
+        "preferredqualifications": 6,
+        "about": 5,
+        "summary": 5,
+        "content": 4,
+        "body": 4,
+        "text": 3,
+    }
+    hits: List[tuple[int, str]] = []
+
+    def _walk(node: Any, parent_key: str = "") -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                _walk(v, str(k))
+            return
+        if isinstance(node, list):
+            for item in node:
+                _walk(item, parent_key)
+            return
+        if not isinstance(node, str):
+            return
+
+        text = _extract_visible_text_from_html(node).strip()
+        if len(text) < 60:
+            return
+        key = (parent_key or "").replace("_", "").replace("-", "").lower()
+        weight = key_weights.get(key, 1)
+        hits.append((weight, text))
+
+    for chunk in script_chunks:
+        try:
+            payload = json.loads(chunk)
+            _walk(payload)
+        except Exception:
+            continue
+
+    if not hits:
+        return ""
+
+    # Keep high-signal chunks first, then longer text, while de-duping.
+    hits.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
+    out: List[str] = []
+    seen: set[str] = set()
+    for _w, text in hits:
+        norm = " ".join(text.split())
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(text)
+        if len("\n\n".join(out)) >= 16000:
+            break
+    return "\n\n".join(out).strip()
+
+
+def _preview_text(value: Any, *, limit: int = 2200) -> str:
+    text = (str(value) if value is not None else "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+
+
+def _probe_linkup_search_error(client: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Best-effort diagnostic probe for SDK failures where the original response body
+    is unavailable (e.g. JSONDecodeError while parsing LinkUp error payload).
+    """
+    out: Dict[str, Any] = {
+        "ok": False,
+        "url": "",
+        "status_code": None,
+        "content_type": "",
+        "body_preview": "",
+        "error": "",
+    }
+
+    try:
+        import httpx
+    except Exception as e:  # pragma: no cover - optional dependency path
+        out["error"] = f"httpx import failed: {type(e).__name__}: {e}"
+        return out
+
+    try:
+        headers_fn = _safe_getattr(client, "_headers", None)
+        headers = headers_fn() if callable(headers_fn) else {}
+        if not isinstance(headers, dict):
+            headers = {}
+        headers["Content-Type"] = "application/json"
+
+        base_url_raw = _safe_getattr(client, "_base_url", "")
+        base_url = str(base_url_raw or "").rstrip("/")
+        endpoint = f"{base_url}/search" if base_url else ""
+        if not endpoint:
+            out["error"] = "Client base URL is unavailable for diagnostic probe."
+            return out
+
+        redacted_headers = {
+            k: ("<redacted>" if k.lower() == "authorization" else v) for k, v in headers.items()
+        }
+
+        response = httpx.post(endpoint, headers=headers, json=payload, timeout=25.0)
+        body_text = (response.text or "").strip()
+        out.update(
+            {
+                "ok": True,
+                "url": endpoint,
+                "status_code": response.status_code,
+                "content_type": (response.headers.get("content-type") or "").strip(),
+                "request_headers": redacted_headers,
+                "body_preview": _preview_text(body_text, limit=2200) if body_text else "<empty body>",
+            }
+        )
+        return out
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
 
 
 class _HTTPLinkupClient:
@@ -127,11 +304,13 @@ def normalize_search_results_to_jobs(
         inferred_location = location or kv.get("location")
         inferred_title = kv.get("title") or kv.get("role") or name or (role or "NA")
 
-        # Best-effort JD text: LinkUp `searchResults.content` is often the page content.
-        # Keep it bounded so we don't balloon memory/artifacts.
+        # For listing/search UX, keep only a short preview.
+        # Full JD extraction should happen only after explicit user selection.
         jd_text = content.strip()
         if jd_text:
-            jd_text = jd_text[:8000]
+            jd_text = jd_text[:600]
+            if len(content) > 600:
+                jd_text = jd_text.rstrip() + "…"
 
         jobs.append(
             {
@@ -145,6 +324,19 @@ def normalize_search_results_to_jobs(
             }
         )
 
+    print(f"\n{'=' * 80}")
+    print("🧭 DEBUG LOG: normalize_search_results_to_jobs output")
+    print(f"raw_results_count={len(results)} deduped_jobs_count={len(jobs)} limit={limit}")
+    for idx, j in enumerate(jobs, start=1):
+        jd = (j.get("jd_text") or "").strip()
+        print(
+            f"[job {idx}] title={j.get('title')} | company={j.get('company')} | location={j.get('location')} | "
+            f"url={j.get('url')} | jd_len={len(jd)}"
+        )
+        if jd and jd != "NA":
+            print(f"[job {idx}] jd_preview:\n{_preview_text(jd, limit=1200)}")
+    print(f"{'=' * 80}\n")
+
     return jobs
 
 
@@ -153,6 +345,7 @@ class LinkupJobSearch:
         api_key = api_key or os.getenv("LINKUP_API_KEY")
         if not api_key:
             raise ValueError("LINKUP_API_KEY not found in .env")
+        self.api_key = api_key
         self.client = SDKLinkupClient(api_key=api_key) if SDKLinkupClient else _HTTPLinkupClient(api_key=api_key)
         self.company_research_agent = CompanyResearchAgent(self.client)
 
@@ -176,6 +369,32 @@ class LinkupJobSearch:
         role = None if intake.role_title == "NA" else intake.role_title
         job_url = None if intake.job_url == "NA" else intake.job_url
         job_description = None if intake.answer == "NA" else intake.answer
+
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: research_from_selected_jd input/output")
+        print(f"selected_payload_keys={list((selected_jd_payload or {}).keys()) if isinstance(selected_jd_payload, dict) else []}")
+        print(f"selected_payload_answer_len={len((selected_jd_payload.get('answer') or '').strip()) if isinstance(selected_jd_payload, dict) else 0}")
+        print(f"selected_payload_sources={selected_jd_payload.get('sources') if isinstance(selected_jd_payload, dict) else []}")
+        print(
+            "normalized_intake="
+            + str(
+                {
+                    "company": company,
+                    "role": role or "NA",
+                    "job_url": job_url or "NA",
+                    "job_description_len": len(job_description or ""),
+                    "location": intake.location,
+                    "workplace_type": intake.workplace_type,
+                    "employment_type": intake.employment_type,
+                    "requirements_summary_len": len((intake.requirements_summary or "").strip()),
+                    "preferred_summary_len": len((intake.preferred_summary or "").strip()),
+                    "compensation_summary_len": len((intake.compensation_summary or "").strip()),
+                }
+            )
+        )
+        if job_description:
+            print(f"normalized_job_description_preview:\n{_preview_text(job_description, limit=2400)}")
+        print(f"{'=' * 80}\n")
 
         return self.company_research_agent.research_company(
             company=company,
@@ -226,6 +445,12 @@ Return all qualifying job links and details. Prioritize official {company_name} 
 
         print(f"🔍 Searching: {role} at {company_name} in {location}")
         print(f"📅 Date filter: {today}")
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: LinkUp job search request")
+        print("api_call=client.search output_type=searchResults depth=deep include_images=False")
+        print(f"role_variants={role_variants}")
+        print(f"query:\n{query}")
+        print(f"{'=' * 80}\n")
 
         try:
             response = self.client.search(
@@ -244,11 +469,159 @@ Return all qualifying job links and details. Prioritize official {company_name} 
             print(f"  role={role!r}")
             print(f"  company={company_name!r}")
             print(f"  location={location!r}")
+            if isinstance(e, json.JSONDecodeError):
+                probe_payload = {
+                    "query": query,
+                    "depth": "deep",
+                    "outputType": "searchResults",
+                    "includeImages": False,
+                }
+                probe = _probe_linkup_search_error(self.client, probe_payload)
+                print("Diagnostics:")
+                if probe.get("ok"):
+                    print(f"  probe_url={probe.get('url')}")
+                    print(f"  status_code={probe.get('status_code')}")
+                    print(f"  content_type={probe.get('content_type')!r}")
+                    print(f"  request_headers={probe.get('request_headers')}")
+                    print(f"  body_preview:\n{probe.get('body_preview')}")
+                else:
+                    print(f"  probe_error={probe.get('error')}")
             print("Traceback:")
             print(tb_text)
             print(f"{'=' * 80}\n")
             raise
+        results = response.get("results") if isinstance(response, dict) else _safe_getattr(response, "results", None)
+        results = results if isinstance(results, list) else []
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: LinkUp job search response")
+        print(f"results_count={len(results)}")
+        for idx, result in enumerate(results[:20], start=1):
+            if isinstance(result, dict):
+                name = (result.get("name") or result.get("title") or "").strip()
+                url = (result.get("url") or "").strip()
+                content = (result.get("content") or result.get("snippet") or "").strip()
+            else:
+                name = (_safe_getattr(result, "name", None) or "").strip()
+                url = (_safe_getattr(result, "url", None) or "").strip()
+                content = (_safe_getattr(result, "content", None) or "").strip()
+            print(f"[result {idx}] name={name or 'NA'} | url={url or 'NA'} | content_len={len(content)}")
+            if content:
+                print(f"[result {idx}] content_preview:\n{_preview_text(content, limit=1200)}")
+        print(f"{'=' * 80}\n")
         return response
+
+    def extract_job_description_from_url(
+        self,
+        job_url: str,
+        *,
+        role: str | None = None,
+        company: str | None = None,
+        existing_jd_text: str | None = None,
+    ) -> dict:
+        """
+        JD extraction from a specific job posting URL using LinkUp `/fetch` only.
+
+        Returns:
+            {
+              "status": "success"|"error",
+              "jd_text": "...",
+              "source_url": "...",
+              "source_name": "...",
+              "error": "..."  # only on error
+            }
+        """
+        url = (job_url or "").strip()
+        if not url or url == "NA":
+            return {
+                "status": "error",
+                "error": "Missing job URL for JD extraction.",
+                "jd_text": "",
+                "source_url": "",
+                "source_name": "",
+            }
+
+        canonical_target = _canonicalize_url(url)
+        existing_text = (existing_jd_text or "").strip()
+
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: JD extraction request")
+        print(f"job_url={url}")
+        print(f"canonical_target={canonical_target}")
+        print(f"role_hint={role or 'NA'} company_hint={company or 'NA'}")
+        print(f"existing_jd_len={len(existing_text)}")
+        print(f"{'=' * 80}\n")
+
+        # Match LinkUp playground defaults to reduce latency and avoid JS-render timeouts.
+        payload = {
+            "url": url,
+            "outputFormat": "markdown",
+            "renderJS": False,
+            "includeRawHtml": False,
+            "extractImages": False,
+        }
+        req = urllib.request.Request(
+            "https://api.linkup.so/v1/fetch",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": f"LinkUp fetch failed: {type(e).__name__}: {e}",
+                "jd_text": "",
+                "source_url": canonical_target or url,
+                "source_name": "",
+            }
+
+        try:
+            parsed = json.loads(body)
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": f"LinkUp fetch returned non-JSON payload: {type(e).__name__}: {e}",
+                "jd_text": "",
+                "source_url": canonical_target or url,
+                "source_name": "",
+            }
+
+        content = (
+            parsed.get("content")
+            or parsed.get("markdown")
+            or ""
+        ).strip() if isinstance(parsed, dict) else ""
+        source_url = (
+            _canonicalize_url((parsed.get("url") or "").strip()) if isinstance(parsed, dict) else ""
+        ) or canonical_target or url
+        if not content:
+            return {
+                "status": "error",
+                "error": "LinkUp fetch returned empty content.",
+                "jd_text": "",
+                "source_url": source_url,
+                "source_name": "",
+            }
+
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: JD extraction via LinkUp fetch")
+        print(f"source_url={source_url}")
+        print(f"content_len={len(content)}")
+        print(f"content_preview:\n{_preview_text(content, limit=2500)}")
+        print(f"{'=' * 80}\n")
+
+        return {
+            "status": "success",
+            "jd_text": content[:12000],
+            "source_url": source_url,
+            "source_name": "linkup_fetch",
+        }
 
     def get_company_profile(self, company: str, query: str | None = None, *, context: Optional[Dict[str, Any]] = None) -> dict:
         """Research company background, funding, culture, tech stack."""

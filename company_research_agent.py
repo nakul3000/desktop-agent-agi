@@ -256,6 +256,48 @@ def _source_to_dict(source: Any) -> Dict[str, Any]:
     }
 
 
+def _to_jsonable(value: Any) -> Any:
+    """
+    Convert SDK/object responses into JSON-serializable primitives.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(v) for v in value]
+
+    if dataclasses.is_dataclass(value):
+        return _to_jsonable(dataclasses.asdict(value))
+
+    model_dump = _safe_getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            # Prefer JSON mode when available (Pydantic v2), which avoids
+            # leaking SDK model instances into nested payloads.
+            return _to_jsonable(model_dump(mode="json"))
+        except Exception:
+            try:
+                return _to_jsonable(model_dump())
+            except Exception:
+                pass
+
+    to_dict = _safe_getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _to_jsonable(to_dict())
+        except Exception:
+            pass
+
+    obj_dict = _safe_getattr(value, "__dict__", None)
+    if isinstance(obj_dict, dict):
+        return _to_jsonable(obj_dict)
+
+    return str(value)
+
+
 _CITATION_RE = re.compile(r"\[(\d{1,4})\]")
 
 
@@ -381,6 +423,17 @@ class CompanyResearchAgent:
         if job_intake is not None:
             # Note: keep both the raw intake dict and the key fields at top-level for prompts.
             context.update(job_intake.to_context_dict())
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: research_company context")
+        print(f"company={company}")
+        print(f"role={role or 'NA'}")
+        print(f"job_url={job_url or 'NA'}")
+        print(f"job_description_len={len((job_description or '').strip())}")
+        print(f"context_keys={sorted(list(context.keys()))}")
+        print(f"requirements_summary_len={len((str(context.get('requirements_summary') or '')).strip())}")
+        print(f"preferred_summary_len={len((str(context.get('preferred_summary') or '')).strip())}")
+        print(f"compensation_summary_len={len((str(context.get('compensation_summary') or '')).strip())}")
+        print(f"{'=' * 80}\n")
         profile = self.research_profile(company, context=context)
         sentiment = self.research_sentiment(company, context=context)
         return {
@@ -462,6 +515,13 @@ class CompanyResearchAgent:
         raw_responses: Dict[str, Any] = {}
 
         for name, prompt in named_prompts:
+            print(f"\n{'=' * 80}")
+            print("🧭 DEBUG LOG: company research query request")
+            print(f"query_name={name}")
+            print(f"depth={depth} output_type=sourcedAnswer max_results={max_results}")
+            print(f"prompt_len={len(prompt)}")
+            print(f"prompt:\n{prompt}")
+            print(f"{'=' * 80}\n")
             response = self._client.search(
                 query=prompt,
                 depth=depth,
@@ -470,11 +530,26 @@ class CompanyResearchAgent:
                 include_images=False,
                 max_results=max_results,
             )
-            raw_responses[name] = response
+            raw_responses[name] = _to_jsonable(response)
 
             answer = _safe_getattr(response, "answer", "") or ""
             sources_obj = _safe_getattr(response, "sources", []) or []
             sources = [_source_to_dict(s) for s in sources_obj]
+            print(f"\n{'=' * 80}")
+            print("🧭 DEBUG LOG: company research query response")
+            print(f"query_name={name}")
+            print(f"answer_len={len(answer)}")
+            print(
+                "answer_preview="
+                + (answer[:2800] + ("...[truncated]" if len(answer) > 2800 else ""))
+            )
+            print(f"source_count={len(sources)}")
+            for idx, src in enumerate(sources, start=1):
+                print(
+                    f"[source {idx}] name={(src.get('name') or '').strip() or 'NA'} | "
+                    f"url={(src.get('url') or '').strip() or 'NA'}"
+                )
+            print(f"{'=' * 80}\n")
 
             queries_run.append(
                 {
@@ -629,12 +704,61 @@ class CompanyResearchAgent:
     # Prompt templates
     # -----------------------------
 
+    @staticmethod
+    def _non_na(value: Any) -> str:
+        text = (str(value).strip() if value is not None else "")
+        if not text or text.upper() == _NA:
+            return ""
+        return text
+
+    def _jd_context_block(self, *, context: Optional[Dict[str, Any]], include_jd_excerpt: bool = False) -> str:
+        ctx = context or {}
+        role = self._non_na(ctx.get("role"))
+        job_url = self._non_na(ctx.get("job_url"))
+        location = self._non_na(ctx.get("location"))
+        workplace_type = self._non_na(ctx.get("workplace_type"))
+        employment_type = self._non_na(ctx.get("employment_type"))
+        compensation = self._non_na(ctx.get("compensation_summary"))
+        requirements = self._non_na(ctx.get("requirements_summary"))
+        preferred = self._non_na(ctx.get("preferred_summary"))
+        job_description = self._non_na(ctx.get("job_description"))
+
+        lines: List[str] = []
+        if role:
+            lines.append(f"- Target role: {role}")
+        if job_url:
+            lines.append(f"- Selected job URL: {job_url}")
+        if location:
+            lines.append(f"- Job location: {location}")
+        if workplace_type:
+            lines.append(f"- Workplace type: {workplace_type}")
+        if employment_type:
+            lines.append(f"- Employment type: {employment_type}")
+        if compensation:
+            lines.append(f"- Compensation signal from JD: {compensation[:280]}")
+        if requirements:
+            lines.append(f"- Requirements signal from JD: {requirements[:420]}")
+        if preferred:
+            lines.append(f"- Preferred qualifications signal from JD: {preferred[:420]}")
+
+        if include_jd_excerpt and job_description:
+            lines.append(f"- JD excerpt: {job_description[:1600]}")
+
+        if not lines:
+            return ""
+
+        return (
+            "\nSelected JD context (use to bias analysis toward this specific role posting):\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
     def _prompt_official_identity(self, *, company: str, context: Optional[Dict[str, Any]]) -> str:
-        role = (context or {}).get("role")
-        extra = f"\nContext role: {role}" if role else ""
+        jd_context = self._jd_context_block(context=context, include_jd_excerpt=False)
         return (
             f"You are an expert company researcher.\n"
-            f"Company: {company}.{extra}\n\n"
+            f"Company: {company}."
+            f"{jd_context}\n"
             "Objective: produce grounded facts for resume tailoring.\n\n"
             "Instructions:\n"
             "- First find the official company website and careers page.\n"
@@ -650,9 +774,11 @@ class CompanyResearchAgent:
         )
 
     def _prompt_funding_financials(self, *, company: str, context: Optional[Dict[str, Any]]) -> str:
+        jd_context = self._jd_context_block(context=context, include_jd_excerpt=False)
         return (
             f"You are an expert business analyst.\n"
-            f"Company: {company}.\n\n"
+            f"Company: {company}."
+            f"{jd_context}\n"
             "Goal: find funding and financial context relevant to hiring and strategy.\n\n"
             "Instructions:\n"
             "- Determine whether the company is public or private.\n"
@@ -664,11 +790,14 @@ class CompanyResearchAgent:
         )
 
     def _prompt_engineering_tech_stack(self, *, company: str, context: Optional[Dict[str, Any]]) -> str:
+        jd_context = self._jd_context_block(context=context, include_jd_excerpt=True)
         return (
             f"You are an expert engineering researcher.\n"
-            f"Company: {company}.\n\n"
+            f"Company: {company}."
+            f"{jd_context}\n"
             "Goal: infer engineering tech stack and priorities.\n\n"
             "Instructions:\n"
+            "- Treat the selected JD context as a targeting hint; prioritize evidence that maps directly to JD requirements.\n"
             "- Use: engineering blog, job postings, public architecture talks, GitHub/org repos, tech radar posts.\n"
             "- Extract concrete signals about: languages, cloud, data/ML stack, CI/CD, infra, observability, security/compliance.\n"
             "- If a claim is weak/inferred, label it as a signal (not a fact).\n\n"
@@ -678,73 +807,91 @@ class CompanyResearchAgent:
         )
 
     def _prompt_hiring_org_leadership(self, *, company: str, context: Optional[Dict[str, Any]]) -> str:
-        role = (context or {}).get("role")
+        role = self._non_na((context or {}).get("role"))
         role_line = f"- Emphasize evidence relevant to role: {role}.\n" if role else ""
+        jd_context = self._jd_context_block(context=context, include_jd_excerpt=True)
         return (
             f"You are an expert recruiter intelligence analyst.\n"
-            f"Company: {company}.\n\n"
+            f"Company: {company}."
+            f"{jd_context}\n"
             "Goal: extract engineering org and hiring signals.\n\n"
             "Instructions:\n"
             "- Identify public engineering leadership (CTO/VP Eng) if available.\n"
             "- Extract hiring priorities from job postings and official comms.\n"
+            "- Map each signal back to this selected JD's responsibilities/requirements when possible.\n"
             f"{role_line}"
             "- Prefer primary sources and reputable reporting.\n\n"
             "Output: bullet list of (signal, why it matters for tailoring) with citations.\n"
         )
 
     def _prompt_strategy_recent_news(self, *, company: str, context: Optional[Dict[str, Any]]) -> str:
+        jd_context = self._jd_context_block(context=context, include_jd_excerpt=False)
         return (
             f"You are an expert market researcher.\n"
-            f"Company: {company}.\n\n"
+            f"Company: {company}."
+            f"{jd_context}\n"
             "Goal: summarize strategic moves and risk factors from the last 12–24 months.\n\n"
             "Instructions:\n"
             "- Find: acquisitions, major launches, partnerships, expansions, layoffs, regulatory issues, lawsuits.\n"
+            "- Prioritize events that could affect this selected role's domain, tooling, or team mandate.\n"
             "- Provide a timeline-style bullet list (date → event → implication).\n"
             "- Cite each bullet.\n"
         )
 
     def _prompt_reviews_summary(self, *, company: str, context: Optional[Dict[str, Any]]) -> str:
+        jd_context = self._jd_context_block(context=context, include_jd_excerpt=False)
         return (
             f"You are an expert organizational psychologist focused on engineering culture.\n"
-            f"Company: {company}.\n\n"
+            f"Company: {company}."
+            f"{jd_context}\n"
             "Goal: aggregate employee sentiment themes relevant to engineering candidates.\n\n"
             "Instructions:\n"
             "- Run several searches across: Glassdoor, Indeed, Blind/TeamBlind, Reddit, and reputable reporting.\n"
             "- Extract recurring themes. Separate what employees like vs dislike.\n"
+            "- Prioritize themes that matter for this selected role's scope (e.g., AI platform ownership, regulated environment, on-call expectations).\n"
             "- Include short quoted snippets when available.\n"
             "- Avoid overconfident conclusions; treat anecdotes as directional.\n\n"
             "Output: bullets under headings Pros_themes, Cons_themes, Engineering_culture_signals, Risk_flags. Cite each bullet.\n"
         )
 
     def _prompt_wlb_oncall(self, *, company: str, context: Optional[Dict[str, Any]]) -> str:
+        jd_context = self._jd_context_block(context=context, include_jd_excerpt=False)
         return (
             f"You are an expert SRE/engineering manager.\n"
-            f"Company: {company}.\n\n"
+            f"Company: {company}."
+            f"{jd_context}\n"
             "Goal: find signals about work-life balance, oncall, incident culture, pace, and burnout risk.\n\n"
             "Instructions:\n"
             "- Use employee reviews, engineering blogs, and credible reporting.\n"
+            "- When possible, connect on-call/operational expectations to this selected role's production responsibilities.\n"
             "- Output bullets with evidence. Cite each bullet.\n"
         )
 
     def _prompt_comp_signals(self, *, company: str, context: Optional[Dict[str, Any]]) -> str:
+        jd_context = self._jd_context_block(context=context, include_jd_excerpt=False)
         return (
             f"You are an expert compensation analyst.\n"
-            f"Company: {company}.\n\n"
+            f"Company: {company}."
+            f"{jd_context}\n"
             "Goal: find compensation signals relevant to engineering roles.\n\n"
             "Instructions:\n"
             "- Use sources like levels.fyi and reputable public datasets or reporting.\n"
             "- Only provide numeric ranges when supported by sources; otherwise describe qualitatively.\n"
+            "- If JD compensation is provided, treat it as anchor context and compare with external benchmarks.\n"
             "- Cite each bullet.\n"
         )
 
     def _prompt_interview_process(self, *, company: str, context: Optional[Dict[str, Any]]) -> str:
+        jd_context = self._jd_context_block(context=context, include_jd_excerpt=False)
         return (
             f"You are an expert interview coach.\n"
-            f"Company: {company}.\n\n"
+            f"Company: {company}."
+            f"{jd_context}\n"
             "Goal: identify common interview process patterns for engineering candidates.\n\n"
             "Instructions:\n"
             "- Use candidate reports and reputable sources.\n"
             "- Summarize rounds, focus areas, and recurring advice.\n"
+            "- Highlight prep focus areas most aligned with this selected role's JD requirements.\n"
             "- Cite each bullet.\n"
         )
 
