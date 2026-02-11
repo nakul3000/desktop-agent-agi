@@ -579,7 +579,7 @@ class JobAgent:
 
     def chat(self, user_message: str) -> str:
         """Process a user message and return agent response."""
-
+        # Log: Processing incoming user message through the agent's chat method
         user_message = (user_message or "").strip()
 
         # Always log the user turn, even for deterministic CLI intercepts.
