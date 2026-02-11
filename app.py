@@ -32,6 +32,40 @@ def _ensure_db_initialized():
     memory.init_db()
     _DB_INITIALIZED = True
 
+
+def _to_json_safe(value):
+    """Best-effort conversion to JSON-serializable primitives."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_safe(v) for v in value]
+
+    # Pydantic v2 models (and compatible SDK models).
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _to_json_safe(model_dump(mode="json"))
+        except Exception:
+            try:
+                return _to_json_safe(model_dump())
+            except Exception:
+                pass
+
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _to_json_safe(to_dict())
+        except Exception:
+            pass
+
+    obj_dict = getattr(value, "__dict__", None)
+    if isinstance(obj_dict, dict):
+        return _to_json_safe(obj_dict)
+
+    return str(value)
+
 load_dotenv()
 
 # ------------------------------------------------------------------ #
@@ -140,6 +174,10 @@ def execute_job_searcher(params: dict) -> str:
     location = params.get("location", "United States")
 
     try:
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: execute_job_searcher input")
+        print(f"role={role!r} company={company!r} location={location!r}")
+        print(f"{'=' * 80}\n")
         searcher = LinkupJobSearch()
         response = searcher.search_jobs(role=role, company=company or None, location=location)
         jobs = normalize_search_results_to_jobs(
@@ -150,6 +188,16 @@ def execute_job_searcher(params: dict) -> str:
             limit=12,
         )
         results_count = len(getattr(response, "results", []) or [])
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: execute_job_searcher output")
+        print(f"search_results_count={results_count} normalized_jobs_count={len(jobs)}")
+        for idx, j in enumerate(jobs, start=1):
+            jd_text = (j.get("jd_text") or "").strip()
+            print(
+                f"[job {idx}] title={j.get('title')} | company={j.get('company')} | location={j.get('location')} | "
+                f"url={j.get('url')} | jd_len={len(jd_text)}"
+            )
+        print(f"{'=' * 80}\n")
         return json.dumps(
             {
                 "status": "success",
@@ -190,15 +238,48 @@ def execute_company_profiler(params: dict) -> str:
 
     company = (params.get("company") or "").strip() or (selected_job.get("company") or "").strip()
 
+    warnings = []
     try:
         searcher = LinkupJobSearch()
 
-        # Fallback: try extracting company from JD-intake payload
-        if not company or company == "NA":
-            if isinstance(job_intake_payload, dict) and job_intake_payload.get("answer"):
+        if (
+            isinstance(job_intake_payload, dict)
+            and isinstance(selected_job, dict)
+            and selected_job.get("url")
+            and selected_job.get("url") != "NA"
+        ):
+            sources = job_intake_payload.get("sources")
+            has_url_source = isinstance(sources, list) and any(
+                isinstance(s, dict) and (s.get("url") or "").strip() == (selected_job.get("url") or "").strip()
+                for s in sources
+            )
+            if not has_url_source:
+                merged_sources = sources if isinstance(sources, list) else []
+                merged_sources.append(
+                    {
+                        "name": selected_job.get("title") or "Selected job posting",
+                        "url": selected_job.get("url"),
+                        "snippet": (selected_job.get("snippet") or "")[:300] or None,
+                        "favicon": None,
+                    }
+                )
+                job_intake_payload = {
+                    "answer": (job_intake_payload.get("answer") or "").strip(),
+                    "sources": merged_sources,
+                }
+
+        intake = None
+        if (
+            isinstance(job_intake_payload, dict)
+            and (job_intake_payload.get("answer") or "").strip()
+        ):
+            try:
                 intake = searcher.build_job_intake(job_intake_payload)
-                if getattr(intake, "company_name", None) and intake.company_name != "NA":
-                    company = intake.company_name
+                parsed_company = (getattr(intake, "company_name", "") or "").strip()
+                if parsed_company and parsed_company != "NA":
+                    company = parsed_company
+            except Exception:
+                intake = None
 
         if not company or company == "NA":
             return json.dumps(
@@ -209,24 +290,120 @@ def execute_company_profiler(params: dict) -> str:
                 indent=2,
             )
 
-        profile = searcher.get_company_profile(company, context=context if isinstance(context, dict) else None)
-        sentiment = searcher.get_company_sentiment(company, context=context if isinstance(context, dict) else None)
-
-        return json.dumps(
-            {
-                "status": "success",
-                "company": company,
-                "profile": profile,
-                "sentiment": sentiment,
-                "next_steps": "Want me to tailor your resume, draft a cover letter, or craft a recruiter message for the selected job?",
-            },
-            indent=2,
+        # Debug trace: show which JD-aware inputs are available for profiling.
+        jd_answer = (
+            (job_intake_payload.get("answer") or "").strip()
+            if isinstance(job_intake_payload, dict)
+            else ""
         )
+        jd_sources = (
+            job_intake_payload.get("sources")
+            if isinstance(job_intake_payload, dict)
+            else []
+        )
+        intake_debug = {}
+        if intake is not None:
+            intake_debug = {
+                "company_name": getattr(intake, "company_name", "NA"),
+                "role_title": getattr(intake, "role_title", "NA"),
+                "location": getattr(intake, "location", "NA"),
+                "workplace_type": getattr(intake, "workplace_type", "NA"),
+                "employment_type": getattr(intake, "employment_type", "NA"),
+                "job_url": getattr(intake, "job_url", "NA"),
+                "requirements_summary_len": len((getattr(intake, "requirements_summary", "") or "")),
+                "preferred_summary_len": len((getattr(intake, "preferred_summary", "") or "")),
+                "compensation_summary_len": len((getattr(intake, "compensation_summary", "") or "")),
+            }
+        elif jd_answer:
+            intake_debug = {"intake_parse_error": "intake parsing failed before research"}
+
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: company_profiler JD context snapshot")
+        print(f"selected_job.company={selected_job.get('company') if isinstance(selected_job, dict) else 'NA'}")
+        print(f"selected_job.url={selected_job.get('url') if isinstance(selected_job, dict) else 'NA'}")
+        print(f"jd_payload_present={bool(jd_answer)}")
+        print(f"jd_answer_len={len(jd_answer)}")
+        print(f"jd_sources_count={len(jd_sources) if isinstance(jd_sources, list) else 0}")
+        print(f"jd_sources_urls={[((s.get('url') or '').strip()) for s in jd_sources if isinstance(s, dict)] if isinstance(jd_sources, list) else []}")
+        print(f"normalized_intake={json.dumps(intake_debug, indent=2)}")
+        print(f"{'=' * 80}\n")
+
+        profile = None
+        sentiment = None
+
+        if (
+            isinstance(job_intake_payload, dict)
+            and (job_intake_payload.get("answer") or "").strip()
+            and intake is not None
+        ):
+            try:
+                print(f"\n{'=' * 80}")
+                print("🧭 DEBUG LOG: company_profiler using JD-aware path")
+                print(f"job_intake_answer_len={len((job_intake_payload.get('answer') or '').strip())}")
+                print(f"job_intake_sources={job_intake_payload.get('sources') or []}")
+                print(f"{'=' * 80}\n")
+                combined = searcher.research_from_selected_jd(
+                    job_intake_payload,
+                    preferred_company=company,
+                )
+                if isinstance(combined, dict):
+                    profile = combined.get("profile")
+                    sentiment = combined.get("sentiment")
+                    combined_company = (combined.get("company") or "").strip()
+                    if combined_company and combined_company != "NA":
+                        company = combined_company
+            except Exception as e:
+                error_type = type(e).__name__
+                tb_text = traceback.format_exc().rstrip()
+                warning_message = (
+                    f"JD-aware profiling failed ({error_type}): {e}. "
+                    "Used fallback company/profile sentiment path."
+                )
+                warnings.append(warning_message)
+                print(f"\n{'=' * 80}")
+                print("⚠️ WARNING LOG: JD-aware company profiling path failed, using fallback path")
+                print(f"Type: {error_type}")
+                print(f"Message: {e}")
+                print("Traceback:")
+                print(tb_text)
+                print(f"{'=' * 80}\n")
+                profile = None
+                sentiment = None
+        elif isinstance(job_intake_payload, dict) and (job_intake_payload.get("answer") or "").strip() and intake is None:
+            warnings.append("JD intake parsing failed before JD-aware profiling; using fallback profile path.")
+
+        if profile is None or sentiment is None:
+            print(f"\n{'=' * 80}")
+            print("🧭 DEBUG LOG: company_profiler using fallback non-JD path")
+            print(f"company={company}")
+            print(f"{'=' * 80}\n")
+            profile = searcher.get_company_profile(company, context=context if isinstance(context, dict) else None)
+            sentiment = searcher.get_company_sentiment(company, context=context if isinstance(context, dict) else None)
+
+        payload = {
+            "status": "success",
+            "company": company,
+            "profile": _to_json_safe(profile),
+            "sentiment": _to_json_safe(sentiment),
+            "warnings": warnings,
+            "next_steps": "Want me to tailor your resume, draft a cover letter, or craft a recruiter message for the selected job?",
+        }
+        return json.dumps(payload, indent=2)
     except Exception as e:
+        error_type = type(e).__name__
+        tb_text = traceback.format_exc().rstrip()
+        print(f"\n{'=' * 80}")
+        print("❌ ERROR LOG: company_profiler failed")
+        print(f"Type: {error_type}")
+        print(f"Message: {e}")
+        print("Traceback:")
+        print(tb_text)
+        print(f"{'=' * 80}\n")
         return json.dumps(
             {
                 "status": "error",
                 "error": str(e),
+                "error_type": error_type,
                 "company": company or "NA",
             },
             indent=2,
@@ -469,6 +646,113 @@ class JobAgent:
             lines.append(f"{i}. {title} — {company} ({location})\n   {url}")
         return "\n".join(lines)
 
+    def _next_action_prompt(self) -> str:
+        return (
+            "What do you want to do next?\n"
+            "- research the company\n"
+            "- tailor my resume (coming next phase)\n"
+            "- write a cover letter (coming next phase)\n"
+            "- message a recruiter (coming next phase)"
+        )
+
+    def _build_job_intake_payload(self, *, jd_text: str, selected_job: dict | None) -> dict:
+        selected_job = selected_job if isinstance(selected_job, dict) else {}
+        url = (selected_job.get("url") or "").strip()
+        title = (selected_job.get("title") or "Selected job posting").strip()
+        snippet = (selected_job.get("snippet") or "").strip()
+        source = {
+            "name": title or "Selected job posting",
+            "url": url or None,
+            "snippet": snippet[:300] or None,
+            "favicon": None,
+        }
+        sources = [source] if source.get("url") else []
+        payload = {
+            "answer": (jd_text or "").strip(),
+            "sources": sources,
+        }
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: built job_intake_payload")
+        print(f"answer_len={len(payload['answer'])}")
+        print(f"sources={payload['sources']}")
+        print(f"answer_full={payload['answer']}")
+        print(f"{'=' * 80}\n")
+        return payload
+
+    def _extract_jd_from_selected_job_url(self, selected_job: dict | None) -> dict:
+        selected_job = selected_job if isinstance(selected_job, dict) else {}
+        job_url = (selected_job.get("url") or "").strip()
+        existing_jd_text = (selected_job.get("jd_text") or "").strip()
+        if not job_url or job_url == "NA":
+            return {"status": "error", "error": "No job URL available for extraction."}
+        try:
+            searcher = LinkupJobSearch()
+            return searcher.extract_job_description_from_url(
+                job_url=job_url,
+                role=(selected_job.get("title") or "").strip() or None,
+                company=(selected_job.get("company") or "").strip() or None,
+                existing_jd_text=existing_jd_text or None,
+            )
+        except Exception as e:
+            return {"status": "error", "error": f"JD extraction failed: {type(e).__name__}: {e}"}
+
+    def _format_company_research_for_cli(self, tool_result: str) -> str:
+        try:
+            parsed = json.loads(tool_result)
+        except Exception:
+            return tool_result if isinstance(tool_result, str) else str(tool_result)
+
+        if not isinstance(parsed, dict):
+            return tool_result if isinstance(tool_result, str) else str(tool_result)
+
+        if parsed.get("status") == "error":
+            error_message = parsed.get("error") or "Unknown error."
+            error_type = (parsed.get("error_type") or "").strip()
+            if error_type:
+                return f"Company profiling failed ({error_type}): {error_message}"
+            return f"Company profiling failed: {error_message}"
+
+        company = (parsed.get("company") or "the selected company").strip()
+        profile = parsed.get("profile") if isinstance(parsed.get("profile"), dict) else {}
+        sentiment = parsed.get("sentiment") if isinstance(parsed.get("sentiment"), dict) else {}
+        warnings = parsed.get("warnings") if isinstance(parsed.get("warnings"), list) else []
+
+        profile_md = (profile.get("report_markdown") or "").strip()
+        sentiment_md = (sentiment.get("report_markdown") or "").strip()
+
+        if not profile_md:
+            profile_md = json.dumps(profile, indent=2) if profile else "No profile report returned."
+        if not sentiment_md:
+            sentiment_md = json.dumps(sentiment, indent=2) if sentiment else "No sentiment report returned."
+
+        warning_block = ""
+        if warnings:
+            warning_block = "Warnings:\n" + "\n".join(f"- {str(w)}" for w in warnings if str(w).strip()) + "\n\n"
+
+        return (
+            f"Here is your company profile + sentiment report for {company}.\n\n"
+            f"{warning_block}"
+            "=== Company Profile ===\n"
+            f"{profile_md}\n\n"
+            "=== Company Sentiment ===\n"
+            f"{sentiment_md}\n\n"
+            "Next step: say 'research another company' or select another job."
+        )
+
+    def _is_company_research_request(self, message: str) -> bool:
+        lowered = (message or "").lower()
+        return any(
+            phrase in lowered
+            for phrase in (
+                "research company",
+                "research the company",
+                "company research",
+                "company profile",
+                "profile the company",
+                "tell me about the company",
+            )
+        ) or ("research" in lowered and "company" in lowered)
+
     def _load_sample_jd_text(self) -> str | None:
         try:
             here = Path(__file__).resolve().parent
@@ -559,6 +843,11 @@ class JobAgent:
                 memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
                 return msg
 
+        if tool_name == "company_profiler":
+            msg = self._format_company_research_for_cli(tool_result)
+            memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+            return msg
+
         # In CLI router mode (no LLM), return tool output directly.
         if self.client is None:
             msg = tool_result if isinstance(tool_result, str) else str(tool_result)
@@ -602,6 +891,11 @@ class JobAgent:
 
                 chosen = jobs[idx - 1]
                 chosen_jd = (chosen.get("jd_text") or "").strip() if isinstance(chosen, dict) else ""
+                print(f"\n{'=' * 80}")
+                print("🧭 DEBUG LOG: job selected by user")
+                print(f"user_selection_index={idx}")
+                print(f"chosen_job={json.dumps(chosen, indent=2)}")
+                print(f"{'=' * 80}\n")
                 self.context_store["selected_job"] = {
                     "job_id": chosen.get("job_id") or str(idx),
                     "title": chosen.get("title") or "NA",
@@ -612,27 +906,50 @@ class JobAgent:
                 }
                 self.awaiting_job_selection = False
 
-                # If we captured JD text from LinkUp search results, store it immediately.
                 selected_job = self.context_store.get("selected_job") or {}
-                selected_jd_text = (selected_job.get("jd_text") or "").strip() if isinstance(selected_job, dict) else ""
-                if selected_jd_text:
-                    self.context_store["job_intake_payload"] = {"answer": selected_jd_text, "sources": []}
+
+                # Always try extracting from the selected link first so downstream profiling
+                # uses JD text that matches the exact posting the user chose.
+                extracted = self._extract_jd_from_selected_job_url(selected_job)
+                extracted_jd_text = (extracted.get("jd_text") or "").strip() if isinstance(extracted, dict) else ""
+                if isinstance(extracted, dict) and extracted.get("status") == "success" and extracted_jd_text:
+                    print(f"\n{'=' * 80}")
+                    print("🧭 DEBUG LOG: selection -> JD source decision")
+                    print("source=selected_job_url_extraction")
+                    print(f"extracted_source_url={(extracted.get('source_url') or '').strip()}")
+                    print(f"extracted_source_name={(extracted.get('source_name') or '').strip()}")
+                    print(f"extracted_jd_len={len(extracted_jd_text)}")
+                    print(f"extracted_jd_full={extracted_jd_text}")
+                    print(f"{'=' * 80}\n")
+                    selected_job["jd_text"] = extracted_jd_text
+                    extracted_source_url = (extracted.get("source_url") or "").strip()
+                    if extracted_source_url:
+                        selected_job["url"] = extracted_source_url
+                    self.context_store["selected_job"] = selected_job
+                    self.context_store["job_intake_payload"] = self._build_job_intake_payload(
+                        jd_text=extracted_jd_text,
+                        selected_job=selected_job,
+                    )
                     msg = (
-                        "Selected. I captured the job description text from search results.\n\n"
-                        "What do you want to do next?\n"
-                        "- research the company\n"
-                        "- tailor my resume\n"
-                        "- write a cover letter\n"
-                        "- message a recruiter"
+                        "Selected. I extracted the job description from the job link.\n\n"
+                        + self._next_action_prompt()
                     )
                     memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
                     return msg
 
-                # Otherwise ask the user to paste (or use sample).
-                self.awaiting_jd_text = True
+                extraction_error = (
+                    extracted.get("error")
+                    if isinstance(extracted, dict) and extracted.get("error")
+                    else "Unknown extraction error."
+                )
+                print(f"\n{'=' * 80}")
+                print("🧭 DEBUG LOG: selection -> JD source decision")
+                print("source=linkup_fetch_error_no_fallback")
+                print(f"url_extraction_error={extraction_error}")
+                print(f"{'=' * 80}\n")
                 msg = (
-                    "Selected. Now paste the full job description text for that role.\n\n"
-                    "Tip: type `sample_jd1` to use the repo sample JD."
+                    "Selected, but JD extraction failed.\n\n"
+                    f"Error: {extraction_error}"
                 )
                 memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
                 return msg
@@ -652,25 +969,29 @@ class JobAgent:
                 selected_job["jd_text"] = jd_text
                 self.context_store["selected_job"] = selected_job
 
-            self.context_store["job_intake_payload"] = {"answer": jd_text, "sources": []}
-            self.awaiting_jd_text = False
-
-            msg = (
-                "Got it. What do you want to do next?\n"
-                "- research the company\n"
-                "- tailor my resume\n"
-                "- write a cover letter\n"
-                "- message a recruiter"
+            self.context_store["job_intake_payload"] = self._build_job_intake_payload(
+                jd_text=jd_text,
+                selected_job=selected_job if isinstance(selected_job, dict) else {},
             )
+            self.awaiting_jd_text = False
+            print(f"\n{'=' * 80}")
+            print("🧭 DEBUG LOG: manual JD intake accepted")
+            print(f"manual_jd_len={len(jd_text)}")
+            print(f"manual_jd_full={jd_text}")
+            print(f"{'=' * 80}\n")
+
+            msg = f"Got it. {self._next_action_prompt()}"
             memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
             return msg
 
         # ---- Optional deterministic router after job selection + JD intake ----
         selected_job = self.context_store.get("selected_job") or {}
+        intake_payload = self.context_store.get("job_intake_payload") or {}
         has_selected_jd = isinstance(selected_job, dict) and bool((selected_job.get("jd_text") or "").strip())
-        if has_selected_jd:
+        has_intake = isinstance(intake_payload, dict) and bool((intake_payload.get("answer") or "").strip())
+        if has_selected_jd or has_intake:
             lowered = user_message.lower()
-            if ("research" in lowered and "company" in lowered) or "company research" in lowered:
+            if self._is_company_research_request(user_message):
                 return self._execute_tool_and_respond(
                     tool_name="company_profiler",
                     params={},
@@ -678,26 +999,29 @@ class JobAgent:
                     user_message=user_message,
                 )
             if "tailor" in lowered and "resume" in lowered:
-                return self._execute_tool_and_respond(
-                    tool_name="resume_tailor",
-                    params={},
-                    reasoning="User requested resume tailoring for the selected job.",
-                    user_message=user_message,
+                msg = (
+                    "Resume tailoring is queued for the next phase. "
+                    "For now I can run company profiling on your selected job. "
+                    "Say: 'research the company'."
                 )
+                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                return msg
             if "cover letter" in lowered:
-                return self._execute_tool_and_respond(
-                    tool_name="cover_letter_generator",
-                    params={},
-                    reasoning="User requested a cover letter for the selected job.",
-                    user_message=user_message,
+                msg = (
+                    "Cover letter generation is queued for the next phase. "
+                    "For now I can run company profiling on your selected job. "
+                    "Say: 'research the company'."
                 )
+                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                return msg
             if any(k in lowered for k in ("recruiter", "outreach", "cold email", "message")):
-                return self._execute_tool_and_respond(
-                    tool_name="email_crafter",
-                    params={"purpose": "cold_outreach"},
-                    reasoning="User requested a recruiter message for the selected job.",
-                    user_message=user_message,
+                msg = (
+                    "Recruiter outreach drafting is queued for the next phase. "
+                    "For now I can run company profiling on your selected job. "
+                    "Say: 'research the company'."
                 )
+                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                return msg
 
         # Get LLM response
         response = self._call_llm()
