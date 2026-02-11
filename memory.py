@@ -415,3 +415,41 @@ __all__ = [
     "register_user",
     "start_session",
 ]
+# ------------------------------------------------------------------ #
+# OO wrapper for compatibility with code that expects `Memory()`
+# ------------------------------------------------------------------ #
+
+class Memory:
+    """
+    Lightweight wrapper around the functional memory module.
+
+    This exists for compatibility with components (e.g., AgentCore/app.py)
+    that expect a Memory object rather than free functions.
+    """
+
+    def __init__(self, db_path: Optional[Union[str, Path]] = None):
+        self.db_path = db_path
+        init_db(db_path=db_path)
+
+    def register_user(self, user_id: str, name: Optional[str] = None, email: Optional[str] = None, meta: Optional[dict] = None) -> int:
+        return register_user(user_id=user_id, name=name, email=email, meta=meta, db_path=self.db_path)
+
+    def start_session(self, user_id: Optional[str] = None, session_id: Optional[str] = None) -> str:
+        return start_session(user_id=user_id, session_id=session_id, db_path=self.db_path)
+
+    def store_turn(self, session_id: str, role: str, text: str, user_id: Optional[str] = None, tool_name: Optional[str] = None) -> int:
+        return store_turn(session_id=session_id, role=role, text=text, user_id=user_id, tool_name=tool_name, db_path=self.db_path)
+
+    def store_artifact(self, session_id: str, type: str, content: str, source_turn_id: Optional[int] = None, created_by: Optional[str] = None, user_id: Optional[str] = None) -> int:
+        return store_artifact(
+            session_id=session_id,
+            type=type,
+            content=content,
+            source_turn_id=source_turn_id,
+            created_by=created_by,
+            user_id=user_id,
+            db_path=self.db_path,
+        )
+
+    def get_context(self, session_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+        return get_context(session_id=session_id, user_id=user_id, db_path=self.db_path)
