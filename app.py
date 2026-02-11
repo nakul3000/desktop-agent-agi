@@ -6,6 +6,7 @@ import json
 import re
 import uuid
 from datetime import datetime
+import requests
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 
@@ -286,19 +287,23 @@ TOOL_EXECUTORS = {
 
 class JobAgent:
     def __init__(self, session_id: str | None = None, user_id: str | None = None):
+        self.llm_mode = os.getenv("LLM_MODE", "hf").lower()
+
         self.hf_token = os.getenv("HF_TOKEN")
-        if not self.hf_token:
-            raise ValueError("HF_TOKEN not found in .env")
+        self.hf_model = os.getenv("HF_MODEL", "google/gemma-2b-it")
+
+        self.ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
 
         self.linkup_api_key = os.getenv("LINKUP_API_KEY")
         if not self.linkup_api_key:
             raise ValueError("LINKUP_API_KEY not found in .env")
 
-        self.client = InferenceClient(
-            # Use a hosted-inference-available model id
-            model="meta-llama/Meta-Llama-3-70B-Instruct",
-            token=self.hf_token,
-        )
+        self.client = None
+        if self.llm_mode == "hf":
+            if not self.hf_token:
+                raise ValueError("HF_TOKEN not found in .env")
+            self.client = InferenceClient(model=self.hf_model, token=self.hf_token)
 
         # Conversation history: list of {"role": "user"/"assistant"/"system", "content": "..."}
         self.conversation_history = []
@@ -336,17 +341,8 @@ class JobAgent:
         # Get LLM response
         response = self._call_llm()
 
-        # Check if the LLM wants to call a tool
+        # Check if LLM wants to call a tool
         tool_call = self._parse_tool_call(response)
-
-        if tool_call:
-            tool_name = tool_call["tool"]
-            params = tool_call.get("parameters", {})
-            reasoning = tool_call.get("reasoning", "")
-
-            print(f"\n🔧 Tool Selected: {tool_name}")
-            print(f"📋 Parameters: {json.dumps(params, indent=2)}")
-            print(f"💭 Reasoning: {reasoning}")
 
             # Execute the tool
             if tool_name in TOOL_EXECUTORS:
@@ -376,7 +372,7 @@ class JobAgent:
                     "content": f"[Tool Result for {tool_name}]:\n{tool_result}\n\nNow summarize these results for the user in a helpful, conversational way. Highlight key findings and suggest logical next steps.",
                 })
 
-                # Get LLM to summarize the tool results
+                # Get LLM to summarize tool results
                 summary = self._call_llm()
 
                 self.conversation_history.append({
@@ -413,18 +409,139 @@ class JobAgent:
                     "content": f"Context packet (recent turns/artifacts/facts): {json.dumps(ctx)[:4000]}"
                 }
             ]
-            response = self.client.chat_completion(
-                messages=messages,
-                max_tokens=1024,
-                temperature=0.7,
-                top_p=0.9,
-            )
-            return response.choices[0].message.content.strip()
+
+            if self.llm_mode == "mock":
+                text = self._mock_llm_response(messages)
+                memory.store_turn(self.session_id, role="assistant", text=text, user_id=self.user_id)
+                memory.store_artifact(self.session_id, "llm_response", text, user_id=self.user_id)
+                return text
+
+            if self.llm_mode == "ollama":
+                text = self._ollama_chat(messages)
+                memory.store_turn(self.session_id, role="assistant", text=text, user_id=self.user_id)
+                memory.store_artifact(self.session_id, "llm_response", text, user_id=self.user_id)
+                return text
+
+            try:
+                if self.client is None:
+                    raise RuntimeError("HF client not initialized")
+                response = self.client.chat_completion(
+                    messages=messages,
+                    max_tokens=1024,
+                    temperature=0.7,
+                    top_p=0.9,
+                )
+                text = response.choices[0].message.content.strip()
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+                if (
+                    "doesn't support task 'conversational'" in err
+                    or "/v1/chat/completions" in err
+                    or "404" in err
+                    or "410" in err
+                ):
+                    prompt = self._messages_to_prompt(messages)
+                    if self.client is None:
+                        raise RuntimeError("HF client not initialized")
+                    text = self.client.text_generation(
+                        prompt,
+                        max_new_tokens=1024,
+                        temperature=0.7,
+                        top_p=0.9,
+                    ).strip()
+                else:
+                    raise
+
+            memory.store_turn(self.session_id, role="assistant", text=text, user_id=self.user_id)
+            memory.store_artifact(self.session_id, "llm_response", text, user_id=self.user_id)
+            return text
         except Exception as e:
+            if self.llm_mode == "mock":
+                text = self._mock_llm_response(self.conversation_history)
+                memory.store_turn(self.session_id, role="assistant", text=text, user_id=self.user_id)
+                memory.store_artifact(self.session_id, "llm_response", text, user_id=self.user_id)
+                return text
             return f"⚠️ LLM Error: {str(e)}"
+
+    def _mock_llm_response(self, messages) -> str:
+        last_user = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user = (m.get("content") or "").strip()
+                break
+        if not last_user:
+            return "(mock)"
+        return f"(mock) You said: {last_user}"
+
+    def _ollama_chat(self, messages) -> str:
+        trimmed = []
+        for m in messages[-20:]:
+            role = m.get("role")
+            if role not in {"system", "user", "assistant"}:
+                continue
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            trimmed.append({"role": role, "content": content})
+
+        payload = {
+            "model": self.ollama_model,
+            "messages": trimmed,
+            "stream": False,
+        }
+
+        try:
+            resp = requests.post(
+                f"{self.ollama_host.rstrip('/')}/api/chat",
+                json=payload,
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            msg = ((data.get("message") or {}).get("content") or "").strip()
+            return msg or "⚠️ Ollama returned empty response"
+        except Exception as e:  # noqa: BLE001
+            return f"⚠️ Ollama Error: {str(e)}"
+
+    def _messages_to_prompt(self, messages) -> str:
+        parts = []
+        for m in messages:
+            role = m.get("role", "")
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+
+            if role == "system":
+                parts.append(f"System: {content}")
+            elif role == "user":
+                parts.append(f"User: {content}")
+            elif role == "assistant":
+                parts.append(f"Assistant: {content}")
+            elif role == "tool":
+                parts.append(f"Tool: {content}")
+            else:
+                parts.append(f"{role.title()}: {content}")
+
+        parts.append("Assistant:")
+        return "\n\n".join(parts)
 
     def _parse_tool_call(self, response: str) -> dict | None:
         """Extract tool call JSON from LLM response."""
+        
+        # First, try to parse as JSON to see what we got
+        try:
+            parsed = json.loads(response)
+            
+            # Handle case where model returns a list with one tool call
+            if isinstance(parsed, list) and len(parsed) > 0:
+                parsed = parsed[0]
+            
+            if isinstance(parsed, dict) and "tool" in parsed and parsed["tool"] in TOOL_NAMES:
+                return parsed
+                
+        except json.JSONDecodeError:
+            pass
+        
         # Try to find JSON block in response
         # Pattern 1: ```json ... ```
         json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
@@ -436,8 +553,8 @@ class JobAgent:
             except json.JSONDecodeError:
                 pass
 
-        # Pattern 2: Raw JSON in response
-        json_match = re.search(r'(\{"tool":\s*"[^"]+?".*?\})', response, re.DOTALL)
+        # Pattern 2: Raw JSON in response (more flexible)
+        json_match = re.search(r'(\{[^{}]*"tool"\s*:\s*"[^"]+"[^{}]*\})', response, re.DOTALL)
         if json_match:
             try:
                 parsed = json.loads(json_match.group(1))
@@ -446,8 +563,16 @@ class JobAgent:
             except json.JSONDecodeError:
                 pass
 
-        # Pattern 3: Look for tool name mentions as fallback
-        # (only if the response clearly indicates a tool should be called)
+        # Pattern 3: Try to find any JSON object with "tool" field
+        json_match = re.search(r'\{[^}]*"tool"[^}]*\}', response, re.DOTALL)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group(0))
+                if "tool" in parsed and parsed["tool"] in TOOL_NAMES:
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
         return None
 
     def _update_context(self, tool_name: str, result: str):
