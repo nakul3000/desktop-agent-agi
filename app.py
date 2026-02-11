@@ -419,7 +419,10 @@ class JobAgent:
                 temperature=0.7,
                 top_p=0.9,
             )
-            return response.choices[0].message.content.strip()
+            text = response.choices[0].message.content.strip()
+            memory.store_turn(self.session_id, role="assistant", text=text, user_id=self.user_id)
+            memory.store_artifact(self.session_id, "llm_response", text, user_id=self.user_id)
+            return text
         except Exception as e:
             return f"⚠️ LLM Error: {str(e)}"
 
