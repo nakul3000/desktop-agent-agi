@@ -1,5 +1,5 @@
 """
-Shared helpers for loading user assets and preparing text for embeddings.
+Shared helpers for loading user assets and normalizing text content.
 """
 
 from __future__ import annotations
@@ -24,14 +24,14 @@ def load_resume_from_env(env_var: str = "RESUME_PATH") -> str | None:
         return None
 
 
-def prepare_text_for_embedding(content: str | Mapping) -> str:
+def normalize_content(content: str | Mapping) -> str:
     """
-    Normalize various content types (dict or string) into a text blob that
-    can be embedded. Keeps behavior deterministic for different sources.
+    Normalize various content types (dict or string) into a text blob for
+    consistent downstream use (logging, storage, summarization, etc.).
     """
     if isinstance(content, Mapping):
         return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
     return str(content)
 
 
-__all__ = ["load_resume_from_env", "prepare_text_for_embedding"]
+__all__ = ["load_resume_from_env", "normalize_content"]
