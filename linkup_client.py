@@ -1,14 +1,7 @@
-# linkup_client.py
-from __future__ import annotations
-
 """
-Thin wrapper around LinkUp search + helper normalization utilities.
+linkup_client.py
 
-This file intentionally:
-- Keeps a stable LinkupClient wrapper so the rest of the codebase is decoupled from SDK changes.
-- Provides a convenience linkup_search() function used by agents.
-- Preserves LinkupJobSearch + research_from_selected_jd() flow.
-- Adds normalize_search_results_to_jobs() used by app.py to render job cards.
+Thin wrapper around LinkUp search plus helper normalization utilities.
 """
 
 import os
@@ -18,31 +11,19 @@ import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-# Auto-load .env when running scripts/tests directly
-try:
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv()
-except Exception:
-    pass
+from dotenv import load_dotenv
 
-# --- Prefer the real SDK ---
-# linkup-sdk exposes `linkup_sdk`, not `linkup` (which may be an unrelated package).
 _SDK_IMPORT_ERROR: Exception | None = None
-_SDKClient = None
-
 try:
-    from linkup_sdk import LinkupClient as _SDKClient  # type: ignore
-except Exception as e1:
-    _SDK_IMPORT_ERROR = e1
-    try:
-        # Fallback if repo previously used "from linkup import LinkupClient"
-        from linkup import LinkupClient as _SDKClient  # type: ignore
-        _SDK_IMPORT_ERROR = None
-    except Exception as e2:
-        _SDK_IMPORT_ERROR = e2
-        _SDKClient = None
+    # SDK variant used in some Linkup versions
+    from linkup import LinkupClient as SDKLinkupClient
+except Exception as e:
+    _SDK_IMPORT_ERROR = e
+    SDKLinkupClient = None
 
 from company_research_agent import CompanyResearchAgent, JobPostingIntake
+
+load_dotenv()
 
 
 def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
@@ -52,9 +33,29 @@ def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
         return default
 
 
-# -------------------------------------------------------------------
-# Normalization helpers (for app.py job cards)
-# -------------------------------------------------------------------
+class _HTTPLinkupClient:
+    """
+    Fallback client when the `linkup` SDK isn't importable.
+
+    We intentionally fail fast with a clear message rather than silently misbehaving,
+    because LinkUp HTTP endpoints/auth can vary by account/version.
+    """
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def search(self, *args: Any, **kwargs: Any) -> Any:
+        import_hint = (
+            f"Original import error: {type(_SDK_IMPORT_ERROR).__name__}: {_SDK_IMPORT_ERROR}"
+            if _SDK_IMPORT_ERROR is not None
+            else "Original import error was not captured."
+        )
+        raise RuntimeError(
+            "LinkUp SDK import failed (`from linkup import LinkupClient`). "
+            f"Install/repair dependency `linkup-sdk` so `LinkupClient.search(...)` is available. "
+            f"Python executable: {sys.executable}. {import_hint}"
+        )
+
 
 _LINE_KV_RE = re.compile(r"(?im)^\s*(company|employer|location|title|role)\s*:\s*(.+?)\s*$")
 
@@ -68,14 +69,14 @@ def normalize_search_results_to_jobs(
     limit: int = 12,
 ) -> List[Dict[str, Any]]:
     """
-    Convert LinkUp `searchResults` response into simple job "cards".
+    Convert LinkUp `searchResults` response into simple "job cards" for UI/CLI.
 
-    We do best-effort extraction:
+    Since `searchResults` is not guaranteed to be structured as jobs, we do:
     - one card per result
-    - try to infer title/company/location from the content (when available)
+    - best-effort extraction for company/location from result.content
     - dedupe by URL
-    - include bounded jd_text (content) to support downstream resume tailoring
     """
+
     results = None
     if isinstance(response, dict):
         results = response.get("results")
@@ -126,9 +127,11 @@ def normalize_search_results_to_jobs(
         inferred_location = location or kv.get("location")
         inferred_title = kv.get("title") or kv.get("role") or name or (role or "NA")
 
+        # Best-effort JD text: LinkUp `searchResults.content` is often the page content.
+        # Keep it bounded so we don't balloon memory/artifacts.
         jd_text = content.strip()
         if jd_text:
-            jd_text = jd_text[:8000]  # bound
+            jd_text = jd_text[:8000]
 
         jobs.append(
             {
@@ -145,135 +148,12 @@ def normalize_search_results_to_jobs(
     return jobs
 
 
-# -------------------------------------------------------------------
-# Stable LinkupClient wrapper (preserved architecture)
-# -------------------------------------------------------------------
-
-class LinkupClient:
-    """
-    Thin, stable wrapper around the LinkUp SDK.
-
-    Keeps the rest of the codebase decoupled from SDK changes.
-    """
-
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("LINKUP_API_KEY")
-        if not self.api_key:
-            raise RuntimeError(
-                "Missing LINKUP_API_KEY environment variable. "
-                "Add it to .env in repo root or export it in your shell."
-            )
-
-        if _SDKClient is None:
-            hint = (
-                f"Original import error: {type(_SDK_IMPORT_ERROR).__name__}: {_SDK_IMPORT_ERROR}"
-                if _SDK_IMPORT_ERROR is not None
-                else "SDK import failed for unknown reasons."
-            )
-            raise RuntimeError(
-                "LinkUp SDK not available. Install the correct dependency:\n"
-                "  pip install linkup-sdk\n\n"
-                f"Python: {sys.executable}\n{hint}"
-            )
-
-        self._client = _SDKClient(api_key=self.api_key)
-
-    def search(
-        self,
-        *,
-        query: str,
-        depth: str = "standard",             # "standard" | "deep"
-        output_type: str = "searchResults",  # or "structured"
-        schema: Optional[Any] = None,        # optional structured schema (if SDK supports)
-        max_results: int = 10,
-        recency_days: Optional[int] = None,  # kept for compatibility; enforce via prompt
-        include_images: bool = False,        # kept for compatibility; not always supported by SDK
-    ) -> Dict[str, Any]:
-        """
-        Execute an agentic search via LinkUp.
-
-        NOTE:
-        Some SDK versions do NOT accept `recency_days` or `include_images`.
-        We keep them in the interface but do not pass them to the SDK.
-        Enforce recency in the query string instead.
-        """
-        payload: Dict[str, Any] = {
-            "query": query,
-            "depth": depth,
-            "max_results": max_results,
-            "output_type": output_type,
-        }
-
-        _ = recency_days
-        _ = include_images
-
-        # Only set structured args when requested
-        if output_type == "structured":
-            if schema is None:
-                raise ValueError("schema is required when output_type='structured'")
-            payload["structured_output_schema"] = schema
-
-        try:
-            resp = self._client.search(**payload)
-        except Exception as e:
-            tb = traceback.format_exc().rstrip()
-            raise RuntimeError(
-                f"LinkUp search failed: {type(e).__name__}: {e}\n\nPayload={payload}\n\nTraceback:\n{tb}"
-            ) from e
-
-        # Normalize to dict
-        if isinstance(resp, dict):
-            return resp
-        if hasattr(resp, "model_dump"):
-            return resp.model_dump()
-        if hasattr(resp, "dict"):
-            return resp.dict()
-        return {"raw": resp}
-
-
-# Convenience functional wrapper (used by agents)
-_client: Optional[LinkupClient] = None
-
-
-def linkup_search(
-    *,
-    query: str,
-    depth: str = "standard",
-    output_type: str = "searchResults",
-    schema: Optional[Any] = None,
-    max_results: int = 10,
-    recency_days: Optional[int] = None,
-    include_images: bool = False,
-) -> Dict[str, Any]:
-    global _client
-    if _client is None:
-        _client = LinkupClient()
-
-    return _client.search(
-        query=query,
-        depth=depth,
-        output_type=output_type,
-        schema=schema,
-        max_results=max_results,
-        recency_days=recency_days,
-        include_images=include_images,
-    )
-
-
-# -------------------------------------------------------------------
-# Preserved "LinkupJobSearch" architecture (for app.py + research intake)
-# -------------------------------------------------------------------
-
 class LinkupJobSearch:
-    def __init__(
-        self,
-        session_id: str | None = None,
-        user_id: str | None = None,
-        api_key: str | None = None,
-    ):
-        _ = session_id
-        _ = user_id
-        self.client = LinkupClient(api_key=api_key)
+    def __init__(self, session_id: str | None = None, user_id: str | None = None, api_key: str | None = None):
+        api_key = api_key or os.getenv("LINKUP_API_KEY")
+        if not api_key:
+            raise ValueError("LINKUP_API_KEY not found in .env")
+        self.client = SDKLinkupClient(api_key=api_key) if SDKLinkupClient else _HTTPLinkupClient(api_key=api_key)
         self.company_research_agent = CompanyResearchAgent(self.client)
 
     def build_job_intake(self, selected_jd_payload: dict) -> JobPostingIntake:
@@ -305,37 +185,179 @@ class LinkupJobSearch:
             job_intake=intake,
         )
 
-    def search_jobs(self, role: str, company: str | None = None, location: str = "United States") -> dict:
+    def search_jobs(self, role: str, company: str = None, location: str = "United States") -> dict:
+        """
+        Search for job openings with detailed extraction prompt.
+        Returns individual job links, titles, locations, and descriptions.
+        """
         today = datetime.now().strftime("%B %d, %Y")
         company_name = company or "top tech companies"
 
+        # Build search variant terms
+        role_variants = [role]
+        role_lower = role.lower()
+        if "machine learning" in role_lower or "ml" in role_lower:
+            role_variants.extend(["ML engineer", "data scientist machine learning", "AI researcher"])
+        elif "software" in role_lower or "swe" in role_lower:
+            role_variants.extend(["software developer", "backend engineer", "full stack engineer"])
+        elif "data" in role_lower:
+            role_variants.extend(["data analyst", "data engineer", "analytics engineer"])
+
+        search_terms = ", ".join([f"'{company_name} {v} jobs {location}'" for v in role_variants])
+
         query = f"""You are a job search specialist. Your objective is to find all current {role} job openings at {company_name} in {location} that are posted today or very recently.
 
-- Today: {today}
-- Only include roles posted today or within the last 7 days.
-- Prioritize official {company_name} career pages when possible.
+1) Search for {company_name} {role} jobs posted today in {location} using terms like: {search_terms}
+2) Focus on official {company_name} career pages and major job boards where {company_name} posts positions.
+3) For each job opening found, extract:
+   - Job title
+   - Location (city/state)
+   - Job posting URL/link
+   - Posting date (verify it's recent)
+   - Brief job description or key requirements
+   - Salary range (if listed)
+4) Verify the positions are:
+   a) Actually at {company_name} (not third-party recruiters)
+   b) {role} related
+   c) Located in {location}
+   d) Posted today ({today}) or very recently (within last 7 days)
 
-For each role found, extract:
-- Job title
-- Location
-- Posting URL
-- Posting date (verify recent)
-- Key requirements / summary
-- Salary range (if available)
-"""
+Return all qualifying job links and details. Prioritize official {company_name} career pages over third-party job boards."""
 
-        return self.client.search(query=query, depth="deep", output_type="searchResults", max_results=12)
+        print(f"🔍 Searching: {role} at {company_name} in {location}")
+        print(f"📅 Date filter: {today}")
+
+        try:
+            response = self.client.search(
+                query=query,
+                depth="deep",
+                output_type="searchResults",
+                include_images=False,
+            )
+        except Exception as e:
+            tb_text = traceback.format_exc().rstrip()
+            print(f"\n{'=' * 80}")
+            print("❌ ERROR LOG: LinkUp client search failed")
+            print(f"Type: {type(e).__name__}")
+            print(f"Message: {e}")
+            print("Request context:")
+            print(f"  role={role!r}")
+            print(f"  company={company_name!r}")
+            print(f"  location={location!r}")
+            print("Traceback:")
+            print(tb_text)
+            print(f"{'=' * 80}\n")
+            raise
+        return response
 
     def get_company_profile(self, company: str, query: str | None = None, *, context: Optional[Dict[str, Any]] = None) -> dict:
+        """Research company background, funding, culture, tech stack."""
         query = query or f"{company} company overview funding tech stack culture engineering team 2025"
-        _ = self.client.search(query=query, depth="deep", output_type="searchResults", max_results=8)
+
+        print(f"🏢 Researching company: {company}")
+        _ = self.client.search(
+            query=query,
+            depth="deep",
+            output_type="searchResults",
+            include_images=False,
+        )
         return self.company_research_agent.research_profile(company, context=context)
 
     def get_company_sentiment(self, company: str, query: str | None = None, *, context: Optional[Dict[str, Any]] = None) -> dict:
+        """Get employee reviews and sentiment analysis."""
         query = query or f"{company} employee reviews glassdoor engineering culture work life balance"
-        _ = self.client.search(query=query, depth="standard", output_type="searchResults", max_results=8)
+
+        print(f"💬 Analyzing sentiment: {company}")
+        _ = self.client.search(
+            query=query,
+            depth="standard",
+            output_type="searchResults",
+            include_images=False,
+        )
+        # Return sentiment analysis report from the dedicated agent
         return self.company_research_agent.research_sentiment(company, context=context)
 
     def find_recruiters(self, company: str, role: str, query: str | None = None) -> dict:
+        """Find recruiters and hiring managers."""
         query = query or f"{company} recruiter hiring manager {role} LinkedIn"
-        return self.client.search(query=query, depth="standard", output_type="searchResults", max_results=8)
+
+        print(f"👤 Finding recruiters: {company} - {role}")
+        response = self.client.search(
+            query=query,
+            depth="standard",
+            output_type="searchResults",
+            include_images=False,
+        )
+        return response
+
+    def full_research(self, role: str, company: str, location: str = None, user_query: str | None = None) -> dict:
+        """Run the full research pipeline for a job query."""
+        print(f"\n{'='*60}")
+        print(f"🚀 Full Research: {role} at {company}")
+        print(f"📍 Location: {location}")
+        print(f"📅 Date: {datetime.now().strftime('%B %d, %Y')}")
+        print(f"{'='*60}\n")
+
+        query = user_query or self._compose_job_query(role=role, company=company, location=location)
+
+        results = {
+            "jobs": self.search_jobs(role, company, location),
+            "company_profile": self.get_company_profile(company, query=query),
+            "sentiment": self.get_company_sentiment(company, query=query),
+            "recruiters": self.find_recruiters(company, role, query=query),
+        }
+
+        print(f"\n{'='*60}")
+        print("✅ Research Complete!")
+        print(f"{'='*80}")
+        for key, value in results.items():
+            if hasattr(value, 'results'):
+                print(f"  📄 {key}: {len(value.results)} results found")
+            else:
+                print(f"  📄 {key}: {type(value).__name__}")
+
+        return results
+
+
+# Compatibility wrapper for app.py imports.
+class LinkupClient(LinkupJobSearch):
+    pass
+
+
+# ----- Quick test -----
+if __name__ == "__main__":
+    searcher = LinkupJobSearch()
+
+    # Test: Job search with detailed extraction
+    print("\n" + "=" * 60)
+    print("TEST: Detailed Job Search")
+    print("=" * 60)
+
+    jobs = searcher.search_jobs(
+        role="Machine Learning Engineer",
+        company="Amazon",
+        location="United States",
+    )
+
+    print(f"\n📋 Response type: {type(jobs)}")
+    print(f"\n{'='*60}")
+    print("RESULTS:")
+    print(f"{'='*60}")
+
+    # Handle different response formats
+    if hasattr(jobs, "results"):
+        for i, result in enumerate(jobs.results, 1):
+            print(f"\n--- Result {i} ---")
+            print(f"  Title:   {getattr(result, 'name', 'N/A')}")
+            print(f"  URL:     {getattr(result, 'url', 'N/A')}")
+            print(f"  Content: {getattr(result, 'content', 'N/A')[:300]}")
+            print()
+    else:
+        print(jobs)
+
+    # Uncomment to run full pipeline (4 API calls)
+    # results = searcher.full_research(
+    #     role="Machine Learning Engineer",
+    #     company="Amazon",
+    #     location="United States",
+    # )
