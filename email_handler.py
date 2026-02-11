@@ -300,7 +300,7 @@ class EmailHandler:
             "includeSources": False,
             "includeImages": False,
             "includeInlineCitations": False,
-            "maxResults": 6,
+            "maxResults": 12,
         }
         try:
             resp = requests.post(self.LINKUP_API_URL, headers=headers, json=payload, timeout=60)
@@ -312,42 +312,219 @@ class EmailHandler:
         except Exception as e:
             return {"error": str(e)}
 
-    @staticmethod
-    def _company_domain_hint(company: str) -> str:
+    # Well-known company domain map — expanded for better coverage.
+    _COMPANY_DOMAIN_MAP: Dict[str, str] = {
+        "google": "google.com", "alphabet": "google.com",
+        "meta": "meta.com", "facebook": "meta.com",
+        "microsoft": "microsoft.com",
+        "amazon": "amazon.com", "aws": "amazon.com",
+        "apple": "apple.com",
+        "netflix": "netflix.com",
+        "nvidia": "nvidia.com",
+        "openai": "openai.com",
+        "anthropic": "anthropic.com",
+        "stripe": "stripe.com",
+        "airbnb": "airbnb.com",
+        "uber": "uber.com",
+        "lyft": "lyft.com",
+        "salesforce": "salesforce.com",
+        "adobe": "adobe.com",
+        "oracle": "oracle.com",
+        "ibm": "ibm.com",
+        "intel": "intel.com",
+        "tesla": "tesla.com",
+        "spacex": "spacex.com",
+        "palantir": "palantir.com",
+        "databricks": "databricks.com",
+        "snowflake": "snowflakecomputing.com",
+        "coinbase": "coinbase.com",
+        "robinhood": "robinhood.com",
+        "doordash": "doordash.com",
+        "instacart": "instacart.com",
+        "figma": "figma.com",
+        "notion": "makenotion.com",
+        "slack": "slack.com",
+        "zoom": "zoom.us",
+        "twilio": "twilio.com",
+        "datadog": "datadoghq.com",
+        "cloudflare": "cloudflare.com",
+        "confluent": "confluent.io",
+        "hashicorp": "hashicorp.com",
+        "elastic": "elastic.co",
+        "mongodb": "mongodb.com",
+        "reddit": "reddit.com",
+        "pinterest": "pinterest.com",
+        "snap": "snap.com", "snapchat": "snap.com",
+        "twitter": "x.com", "x": "x.com",
+        "linkedin": "linkedin.com",
+        "spotify": "spotify.com",
+        "shopify": "shopify.com",
+        "squarespace": "squarespace.com",
+        "tiktok": "tiktok.com", "bytedance": "bytedance.com",
+        "samsung": "samsung.com",
+        "jpmorgan": "jpmorgan.com", "jp morgan": "jpmorgan.com",
+        "goldman sachs": "gs.com", "goldman": "gs.com",
+        "deloitte": "deloitte.com",
+        "mckinsey": "mckinsey.com",
+    }
+
+    _FREE_EMAIL_DOMAINS = frozenset({
+        "gmail.com", "yahoo.com", "outlook.com", "hotmail.com",
+        "proton.me", "protonmail.com", "aol.com", "icloud.com",
+        "mail.com", "zoho.com", "yandex.com", "gmx.com",
+    })
+
+    @classmethod
+    def _company_domain_hint(cls, company: str) -> str:
         name = (company or "").strip().lower()
-        if name in {"google", "alphabet"}:
-            return "google.com"
-        if name in {"meta", "facebook"}:
-            return "meta.com"
-        if name in {"microsoft"}:
-            return "microsoft.com"
-        if name in {"amazon", "aws"}:
-            return "amazon.com"
+        # Exact match first.
+        if name in cls._COMPANY_DOMAIN_MAP:
+            return cls._COMPANY_DOMAIN_MAP[name]
+        # Partial match: check if any key is contained in the company name.
+        for key, domain in cls._COMPANY_DOMAIN_MAP.items():
+            if key in name:
+                return domain
         return ""
 
-    def _looks_like_corporate_email(self, email: str, company: str) -> bool:
+    @classmethod
+    def _infer_domain_from_company_name(cls, company: str) -> str:
+        """
+        Heuristic: when no known domain mapping exists, guess '<sanitized>.com'.
+        Only used as a weak validation signal, never as the email itself.
+        """
+        hint = cls._company_domain_hint(company)
+        if hint:
+            return hint
+        sanitized = re.sub(r"[^a-z0-9]", "", (company or "").strip().lower())
+        if sanitized:
+            return f"{sanitized}.com"
+        return ""
+
+    def _looks_like_corporate_email(self, email: str, company: str, *, discovered_domains: Optional[set] = None) -> bool:
+        """
+        Check whether an email looks like a corporate/work address for the given
+        company. Uses the known domain map, any domains already discovered for this
+        company during this search session, and a free-provider blocklist.
+        """
         if not email or "@" not in email:
             return False
         domain = email.split("@", 1)[1].lower()
+
+        # Known domain match.
         hint = self._company_domain_hint(company)
         if hint and domain.endswith(hint):
             return True
-        if domain.endswith(("gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "proton.me", "protonmail.com")):
+
+        # Match against domains already collected for this company in the same search.
+        if discovered_domains and domain in discovered_domains:
+            return True
+
+        # Reject free-provider addresses.
+        if domain in self._FREE_EMAIL_DOMAINS:
             return False
+
+        # Heuristic: if the domain contains the company name (lowered, no spaces), accept.
+        company_slug = re.sub(r"[^a-z0-9]", "", (company or "").strip().lower())
+        if company_slug and company_slug in domain:
+            return True
+
+        # Unknown domain — accept tentatively (could be a recruiting agency).
         return True
 
     @staticmethod
     def _is_full_email(email: str) -> bool:
         """
         Accept only complete, non-obfuscated emails.
-        Reject masked forms like d***@google.com.
+        Reject masked forms like d***@google.com or placeholder text.
         """
         if not email:
             return False
         e = email.strip()
-        if "*" in e:
+        if "*" in e or "..." in e or "example.com" in e.lower():
             return False
         return re.fullmatch(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", e, flags=re.IGNORECASE) is not None
+
+    @staticmethod
+    def _is_placeholder_email(email: str) -> bool:
+        """
+        Reject obvious placeholder emails (e.g. z@anthropic.io, first.last@stripe.com,
+        f.last@, first_last@) so they are not shown as valid contacts.
+        """
+        if not email or "@" not in email:
+            return True
+        local = email.strip().split("@", 1)[0].lower()
+        if len(local) <= 1:
+            return True
+        # Single letter
+        if re.match(r"^[a-z]$", local):
+            return True
+        # first.last, firstname.lastname, f.last, first_last, last.first, etc.
+        if re.match(r"^first\.?last$", local) or re.match(r"^firstname\.?lastname$", local):
+            return True
+        if re.match(r"^f\.last$", local) or re.match(r"^first_last$", local):
+            return True
+        if re.match(r"^[a-z]\.last$", local):  # f.last, a.last, etc.
+            return True
+        if local in ("name", "email", "user", "contact", "recruiter", "hr"):
+            return True
+        return False
+
+    @staticmethod
+    def _is_relay_or_marketing_email(email: str) -> bool:
+        """
+        Reject reply relays, no-reply addresses, and known marketing/transactional
+        domains (e.g. reply-xxx@reply.s12.y.mc.salesf...) so they are not shown as contacts.
+        """
+        if not email or "@" not in email:
+            return True
+        e = email.strip().lower()
+        local, _, domain = e.partition("@")
+        if not domain:
+            return True
+        # Local part: reply-*, noreply, no-reply, donotreply
+        if local.startswith("reply-") or local.startswith("reply_"):
+            return True
+        if local in ("noreply", "no-reply", "donotreply", "do-not-reply", "mailer-daemon"):
+            return True
+        if ".html" in local or re.search(r"-\d{5,}-", local):  # reply-ff3013717660-321_HTML-...
+            return True
+        # Domain: reply.*, *.reply.*, known relay/marketing hosts
+        if "reply." in domain or ".reply." in domain or domain.startswith("reply."):
+            return True
+        relay_domains = (
+            "mc.salesf", "sendgrid", "mailchimp", "mandrill", "mailgun",
+            "amazonses", "outbound.", "bounce.", "mail.", "smtp.",
+        )
+        for r in relay_domains:
+            if r in domain:
+                return True
+        return False
+
+    @staticmethod
+    def _extract_all_emails_from_text(text: str) -> List[str]:
+        """
+        Pull all email-address-shaped strings from arbitrary text.
+        Useful for scraping emails out of Linkup answer blobs.
+        """
+        if not text:
+            return []
+        return re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.IGNORECASE)
+
+    @staticmethod
+    def _extract_linkedin_urls(text: str) -> List[str]:
+        """Extract LinkedIn profile URLs from text."""
+        if not text:
+            return []
+        return re.findall(r"https?://(?:www\.)?linkedin\.com/in/[A-Za-z0-9_-]+/?", text)
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        """Normalize a person's name for dedup (lowercase, strip titles)."""
+        n = (name or "").strip().lower()
+        for prefix in ("mr.", "mrs.", "ms.", "dr.", "prof."):
+            if n.startswith(prefix):
+                n = n[len(prefix):].strip()
+        return n
 
     # ==========================
     # 1. READ & PARSE EMAILS
@@ -722,8 +899,7 @@ class EmailHandler:
                         }
                     )
         except Exception as e:
-            print(f"Extraction parsing failed: {e}. Raw response: {response}")
-            
+            print(f"Extraction parsing failed: {e}")
         return info
 
     def extract_info_from_thread(self, thread_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -893,171 +1069,318 @@ class EmailHandler:
         min_emails: int = 3,
     ) -> Dict[str, Any]:
         """
-        Use Linkup to find recruiter contact details.
+        Use Linkup to find recruiter contact details for a specific company and role.
+
+        Improvements over the original:
+        - Uses a richer schema that asks for *multiple* contacts per query (name, email,
+          title, linkedin_url) reducing the number of API calls needed.
+        - Better-targeted queries that explicitly mention LinkedIn, career pages, etc.
+        - Extracts emails and LinkedIn URLs from the raw Linkup response text as a
+          fallback when structured output is incomplete.
+        - Deduplicates contacts by normalized name to avoid returning the same person twice.
+        - Discovers corporate email domains from early results and uses them to validate
+          subsequent contacts.
+        - Provides actionable fallback suggestions including LinkedIn search URLs.
+
         Returns:
           {
             "name": "...",
+            "title": "...",
             "email": "...",
             "emails": ["..."],
-            "contacts": [{"name","email","confidence","source"}],
+            "linkedin_urls": ["..."],
+            "contacts": [{"name","title","email","linkedin_url","confidence","source"}],
             "confidence": "high|medium|low",
             "source": "...",
             "fallback_suggestion": "..."
           }
         """
+        # Richer schema: ask for an *array* of contacts per query (aim for multiple).
         schema = {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Recruiter full name if found, else empty string"},
-                "email": {"type": "string", "description": "Recruiter email address if found, else empty string"},
-                "confidence": {"type": "string", "description": "high, medium, or low"},
-                "source": {"type": "string", "description": "Source URL or source note"},
-                "fallback_suggestion": {"type": "string", "description": "Suggestion if no valid email found"},
+                "contacts": {
+                    "type": "array",
+                    "description": "List of recruiter or hiring contacts at this company. Include as many as you can find (aim for at least 3–5 different people with their work email addresses). Each contact must have a valid email.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Recruiter full name"},
+                            "title": {"type": "string", "description": "Recruiter job title (e.g., Senior Technical Recruiter)"},
+                            "email": {"type": "string", "description": "Recruiter email address (full, not masked/obfuscated)"},
+                            "linkedin_url": {"type": "string", "description": "LinkedIn profile URL if available"},
+                            "confidence": {"type": "string", "description": "high, medium, or low"},
+                            "source": {"type": "string", "description": "Where this contact info was found"},
+                        },
+                        "required": ["name", "email"],
+                    },
+                },
+                "fallback_suggestion": {
+                    "type": "string",
+                    "description": "If no recruiter emails found, suggest how to reach the company's recruiting team",
+                },
             },
-            "required": ["name", "email", "confidence", "source", "fallback_suggestion"],
+            "required": ["contacts", "fallback_suggestion"],
         }
 
         domain = self._company_domain_hint(company)
-        # Tier 1: role-specific queries (best match)
+        team_clause = f" {team_or_domain}" if team_or_domain else ""
+
+        # Tier 1: Focused queries that are most likely to surface actual recruiter contacts.
+        # Each query is crafted to hit different source types.
         role_specific_queries = [
-            f"{company} {role_title} recruiter email",
-            f"{company} machine learning recruiter contact email",
-            f"{company} hiring recruiter {team_or_domain} email",
-            f"{company} talent acquisition email {role_title}",
+            f"site:linkedin.com/in {company}{team_clause} recruiter OR 'talent acquisition' {role_title}",
+            f"{company}{team_clause} recruiter email address {role_title} contact",
+            f"{company} hiring team {role_title} recruiter name email",
         ]
-        # Tier 2: broader recruiting contact fallback when role-specific fails
+        # Tier 2: Broader fallback queries when role-specific ones don't yield enough.
         broad_fallback_queries = [
-            f"{company} recruiter email",
-            f"{company} talent acquisition email",
-            f"{company} university recruiting email",
-            f"{company} careers contact email",
-            f"{company} hr contact email",
+            f"site:linkedin.com/in {company} technical recruiter OR 'talent acquisition partner'",
+            f"{company} recruiting team email contact careers",
+            f"{company} talent acquisition email recruiter contact",
+        ]
+        # Tier 3: When we still have too few contacts, ask explicitly for multiple recruiters.
+        multi_recruiter_queries = [
+            f"{company} list of recruiter emails hiring team contacts",
+            f"{company} multiple recruiters talent acquisition team {role_title}",
         ]
 
-        best = {
+        # Accumulator state.
+        collected_contacts: List[Dict[str, str]] = []
+        seen_emails: set = set()
+        seen_names: set = set()
+        discovered_domains: set = set()  # Corporate domains found so far.
+        all_linkedin_urls: List[str] = []
+        seen_linkedin: set = set()
+        best_name = ""
+        best_title = ""
+        best_source = ""
+        best_conf = "low"
+        best_fallback = ""
+
+        conf_rank = {"low": 0, "medium": 1, "high": 2}
+
+        def _add_contact(
+            name: str,
+            email: str,
+            *,
+            title: str = "",
+            linkedin_url: str = "",
+            confidence: str = "medium",
+            source: str = "",
+        ) -> bool:
+            """
+            Validate and add a single contact to the collection.
+            Returns True if it was added (new and valid).
+            """
+            nonlocal best_name, best_title, best_source, best_conf
+
+            email = (email or "").strip()
+            name = (name or "").strip()
+            title = (title or "").strip()
+            linkedin_url = (linkedin_url or "").strip()
+            confidence = (confidence or "medium").lower().strip()
+            if confidence not in conf_rank:
+                confidence = "medium"
+
+            # Track recruiter identity regardless of whether email is usable.
+            if name and not best_name:
+                best_name = name
+            if title and not best_title:
+                best_title = title
+            if source and not best_source:
+                best_source = source
+            if conf_rank.get(confidence, 0) > conf_rank.get(best_conf, 0):
+                best_conf = confidence
+
+            # Collect LinkedIn URLs.
+            if linkedin_url and linkedin_url not in seen_linkedin:
+                seen_linkedin.add(linkedin_url)
+                all_linkedin_urls.append(linkedin_url)
+
+            # Validate email.
+            if not email or not self._is_full_email(email):
+                return False
+            if self._is_placeholder_email(email):
+                return False
+            if self._is_relay_or_marketing_email(email):
+                return False
+            if not self._looks_like_corporate_email(email, company, discovered_domains=discovered_domains):
+                return False
+
+            email_l = email.lower()
+            if email_l in seen_emails:
+                return False
+
+            # Deduplicate by name: if we already have a contact with the same name, skip
+            # (keep the first occurrence which tends to be higher quality).
+            norm = self._normalize_name(name)
+            if norm and norm in seen_names:
+                return False
+
+            # Track the domain for future validation.
+            email_domain = email_l.split("@", 1)[1]
+            if email_domain not in self._FREE_EMAIL_DOMAINS:
+                discovered_domains.add(email_domain)
+
+            seen_emails.add(email_l)
+            if norm:
+                seen_names.add(norm)
+
+            collected_contacts.append({
+                "name": name,
+                "title": title,
+                "email": email,
+                "linkedin_url": linkedin_url,
+                "confidence": confidence,
+                "source": source,
+            })
+            return True
+
+        def _process_linkup_response(out: Dict[str, Any], *, query: str) -> None:
+            """
+            Process a Linkup structured response.
+            Extracts contacts from the structured output AND scrapes the raw
+            response text for emails/LinkedIn URLs that the model may have missed.
+            """
+            nonlocal best_fallback
+
+            if out.get("error"):
+                return
+
+            # 1) Process structured contacts array.
+            contacts_arr = out.get("contacts") or []
+            if isinstance(contacts_arr, list):
+                for c in contacts_arr:
+                    if not isinstance(c, dict):
+                        continue
+                    _add_contact(
+                        name=str(c.get("name") or ""),
+                        email=str(c.get("email") or ""),
+                        title=str(c.get("title") or ""),
+                        linkedin_url=str(c.get("linkedin_url") or ""),
+                        confidence=str(c.get("confidence") or "medium"),
+                        source=str(c.get("source") or query),
+                    )
+
+            # 2) Backwards-compat: also check top-level name/email (older schema shape).
+            top_email = str(out.get("email") or "").strip()
+            top_name = str(out.get("name") or "").strip()
+            if top_email:
+                _add_contact(
+                    name=top_name,
+                    email=top_email,
+                    title=str(out.get("title") or ""),
+                    confidence=str(out.get("confidence") or "medium"),
+                    source=str(out.get("source") or query),
+                )
+
+            # 3) Scrape the entire response blob for any emails/LinkedIn URLs
+            #    that the structured output didn't capture.
+            blob = json.dumps(out)
+            scraped_emails = self._extract_all_emails_from_text(blob)
+            for se in scraped_emails:
+                _add_contact(name="", email=se, source=f"scraped from response to: {query[:60]}")
+
+            scraped_linkedin = self._extract_linkedin_urls(blob)
+            for url in scraped_linkedin:
+                if url not in seen_linkedin:
+                    seen_linkedin.add(url)
+                    all_linkedin_urls.append(url)
+
+            # 4) Capture fallback suggestions.
+            fallback = str(out.get("fallback_suggestion") or "").strip()
+            if fallback and not best_fallback:
+                best_fallback = fallback
+
+        def search_queries(queries: List[str], *, tier: str) -> None:
+            for q in queries:
+                out = self._call_linkup_structured(query=q, schema=schema, depth="deep")
+                _process_linkup_response(out, query=q)
+
+        # Execute tiered search.
+        search_queries(role_specific_queries, tier="role_specific")
+
+        if len(collected_contacts) < max(min_emails, 1):
+            search_queries(broad_fallback_queries, tier="broad_fallback")
+
+        if len(collected_contacts) < max(min_emails, 1):
+            search_queries(multi_recruiter_queries, tier="multi_recruiter")
+
+        # Sort: same-company contacts first, then by confidence (descending).
+        target_domain = self._company_domain_hint(company)
+        inferred = self._infer_domain_from_company_name(company)
+        target_domains = {d for d in (target_domain, inferred) if d}
+
+        def _contact_sort_key(c: Dict[str, Any]) -> Tuple[int, int]:
+            email_addr = (c.get("email") or "").strip().lower()
+            if not email_addr or "@" not in email_addr:
+                return (1, 0)
+            domain = email_addr.split("@", 1)[1]
+            same_company = 0 if domain in target_domains else 1
+            conf = conf_rank.get(str(c.get("confidence", "low")), 0)
+            return (same_company, -conf)
+
+        collected_contacts.sort(key=_contact_sort_key)
+        top_contacts = collected_contacts[: max(min_emails, 1)]
+        emails = [c["email"] for c in top_contacts]
+
+        # Build the result.
+        result: Dict[str, Any] = {
             "name": "",
+            "title": "",
             "email": "",
-            "emails": [],
-            "contacts": [],
+            "emails": emails,
+            "linkedin_urls": all_linkedin_urls[:5],
+            "contacts": top_contacts,
             "confidence": "low",
             "source": "",
             "fallback_suggestion": "",
         }
-        best_name = ""
-        best_source = ""
-        best_conf = "low"
-        # Collect multiple unique emails so we can return at least top 3 when available.
-        collected_contacts: List[Dict[str, str]] = []
-        seen_emails = set()
 
-        conf_rank = {"low": 0, "medium": 1, "high": 2}
+        if top_contacts:
+            primary = top_contacts[0]
+            result["name"] = primary.get("name") or best_name
+            result["title"] = primary.get("title") or best_title
+            result["email"] = primary["email"]
+            result["confidence"] = primary.get("confidence") or best_conf
+            result["source"] = primary.get("source") or best_source
+        else:
+            # No usable emails found — build a helpful fallback.
+            result["name"] = best_name
+            result["title"] = best_title
+            result["source"] = best_source
+            result["confidence"] = "low" if not best_name else best_conf
 
-        def search_queries(queries: List[str], *, tier: str) -> None:
-            nonlocal best, best_name, best_source, best_conf, collected_contacts, seen_emails
-            for q in queries:
-                out = self._call_linkup_structured(query=q, schema=schema, depth="deep")
-                if out.get("error"):
-                    continue
-
-                name = str(out.get("name") or "").strip()
-                email = str(out.get("email") or "").strip()
-                conf = str(out.get("confidence") or "low").lower().strip()
-                source = str(out.get("source") or "").strip()
-                fallback = str(out.get("fallback_suggestion") or "").strip()
-                if conf not in {"high", "medium", "low"}:
-                    conf = "low"
-
-                # Extract email if model put it elsewhere.
-                if not email:
-                    blob = json.dumps(out)
-                    m = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", blob, re.IGNORECASE)
-                    if m:
-                        email = m.group(0)
-
-                # Save recruiter identity even when email is missing, for fallback outreach.
-                if name and not best_name:
-                    best_name = name
-                if source and not best_source:
-                    best_source = source
-                if conf in {"high", "medium"} and best_conf == "low":
-                    best_conf = conf
-
-                # Accept only complete, non-masked emails for downstream use.
-                if email and self._is_full_email(email) and self._looks_like_corporate_email(email, company):
-                    email_l = email.lower()
-                    if email_l not in seen_emails:
-                        seen_emails.add(email_l)
-                        collected_contacts.append(
-                            {
-                                "name": name,
-                                "email": email,
-                                "confidence": conf,
-                                "source": source,
-                            }
-                        )
-
-                    # Keep a single "best" contact for backward compatibility.
-                    if (
-                        not best.get("email")
-                        or conf_rank.get(conf, 0) > conf_rank.get(str(best.get("confidence", "low")), 0)
-                    ):
-                        best = {
-                            "name": name,
-                            "email": email,
-                            "emails": [c["email"] for c in collected_contacts],
-                            "contacts": collected_contacts,
-                            "confidence": conf,
-                            "source": source,
-                            "fallback_suggestion": fallback,
-                        }
-
-                    # Stop early only if we already reached target email count in role-specific tier.
-                    if tier == "role_specific" and len(collected_contacts) >= max(min_emails, 1):
-                        return
-
-                elif fallback and not best.get("fallback_suggestion"):
-                    best["fallback_suggestion"] = fallback
-
-        # First try role-specific recruiter contact.
-        search_queries(role_specific_queries, tier="role_specific")
-
-        # If no valid role-specific email, broaden search to generic recruiting contacts.
-        if len(collected_contacts) < max(min_emails, 1):
-            search_queries(broad_fallback_queries, tier="broad_fallback")
-
-        # Finalize aggregated emails/contacts sorted by confidence then stable order.
-        if collected_contacts:
-            collected_contacts.sort(key=lambda c: conf_rank.get(str(c.get("confidence", "low")), 0), reverse=True)
-            top_contacts = collected_contacts[: max(min_emails, 1)]
-            emails = [c["email"] for c in top_contacts]
-            best["contacts"] = top_contacts
-            best["emails"] = emails
-            # Keep primary fields compatible with prior output shape.
-            best["email"] = emails[0]
-            if not best.get("name"):
-                best["name"] = top_contacts[0].get("name", "")
-            if not best.get("source"):
-                best["source"] = top_contacts[0].get("source", "")
-            if not best.get("confidence"):
-                best["confidence"] = top_contacts[0].get("confidence", "medium")
-            return best
-
-        if not best.get("email"):
-            best["name"] = best_name
-            best["source"] = best_source
-            best["confidence"] = "low" if not best_name else best_conf
-            best["emails"] = []
-            best["contacts"] = []
-            best["fallback_suggestion"] = (
-                best.get("fallback_suggestion")
-                or (
-                    f"No public full recruiter email found. Use recruiting@{domain} if available, "
-                    f"or send LinkedIn outreach to {company} recruiters."
-                    if domain
-                    else f"No public full recruiter email found. Use LinkedIn outreach to {company} recruiters."
+        # Construct an actionable fallback suggestion.
+        if not result["email"]:
+            parts: List[str] = []
+            if best_fallback:
+                parts.append(best_fallback)
+            if all_linkedin_urls:
+                parts.append(f"LinkedIn profiles found: {', '.join(all_linkedin_urls[:3])}")
+            if domain:
+                parts.append(
+                    f"Try common patterns: recruiting@{domain}, careers@{domain}, "
+                    f"talent@{domain}"
                 )
+            if best_name:
+                parts.append(f"Recruiter name found: {best_name}. Try LinkedIn outreach.")
+            # Always include a LinkedIn search link.
+            company_encoded = company.replace(" ", "+")
+            role_encoded = role_title.replace(" ", "+")
+            linkedin_search = (
+                f"https://www.linkedin.com/search/results/people/"
+                f"?keywords={company_encoded}+recruiter+{role_encoded}"
             )
-        return best
+            parts.append(f"LinkedIn recruiter search: {linkedin_search}")
+            result["fallback_suggestion"] = " | ".join(parts) if parts else (
+                f"No recruiter contact found. Search LinkedIn for {company} recruiters."
+            )
+        else:
+            result["fallback_suggestion"] = best_fallback
+
+        return result
 
     def build_job_fit_profile(
         self,
@@ -1283,9 +1606,13 @@ class EmailHandler:
         return {
             "recruiter": {
                 "name": recruiter.get("name", ""),
+                "title": recruiter.get("title", ""),
                 "email": recruiter.get("email", ""),
                 "emails": recruiter.get("emails", []),
+                "linkedin_urls": recruiter.get("linkedin_urls", []),
+                "contacts": recruiter.get("contacts", []),
                 "confidence": recruiter.get("confidence", "low"),
+                "fallback_suggestion": recruiter.get("fallback_suggestion", ""),
             },
             "email_subject": draft.get("subject", ""),
             "email_body": draft.get("body", ""),
