@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import json
+import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,12 +116,36 @@ class JobPostingIntake:
 
         job_url = _extract_best_job_url(sources_list)
 
+        parse_mode = "regex"
         company, role, location = _extract_company_role_location(answer)
         workplace = _extract_workplace_type(answer)
         employment = _extract_employment_type(answer)
         comp = _extract_section_block(answer, header="Salary range")
         reqs = _extract_section_block(answer, header="Requirements")
         pref = _extract_section_block(answer, header="Preferred")
+
+        # Raw job descriptions from selected-job intake usually do not follow
+        # LinkUp sourcedAnswer formatting, so we use an LLM parser first there.
+        if not _looks_like_linkup_summary(answer):
+            llm_fields = _parse_jd_with_llm(answer)
+            parse_mode = "llm" if _has_meaningful_llm_parse(llm_fields) else "llm_fallback_regex"
+            company = _pick_non_na(llm_fields.get("company_name"), company)
+            role = _pick_non_na(llm_fields.get("role_title"), role)
+            location = _pick_non_na(llm_fields.get("location"), location)
+            workplace = _pick_non_na(llm_fields.get("workplace_type"), workplace)
+            employment = _pick_non_na(llm_fields.get("employment_type"), employment)
+            comp = _pick_non_na(llm_fields.get("compensation_summary"), comp)
+            reqs = _pick_non_na(llm_fields.get("requirements_summary"), reqs)
+            pref = _pick_non_na(llm_fields.get("preferred_summary"), pref)
+
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: intake parsing mode")
+        print(f"mode={parse_mode}")
+        print(f"answer_len={len(answer) if answer != _NA else 0}")
+        print(f"company={company}")
+        print(f"role={role}")
+        print(f"location={location}")
+        print(f"{'=' * 80}\n")
 
         return JobPostingIntake(
             answer=answer,
@@ -167,6 +195,190 @@ _HIRING_RE = re.compile(
     r"^\s*(?P<company>.+?)\s+is\s+hiring\s+(?:an?|the)\s+(?P<role>.+?)(?:\s+for\s+.+?)?\s+in\s+(?P<location>.+?)\.\s*",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _pick_non_na(primary: Optional[str], fallback: Optional[str]) -> str:
+    left = (primary or "").strip()
+    if left and left.upper() != _NA:
+        return left
+    right = (fallback or "").strip()
+    if right and right.upper() != _NA:
+        return right
+    return _NA
+
+
+def _looks_like_linkup_summary(answer: str) -> bool:
+    if not answer or answer == _NA:
+        return False
+    if _HIRING_RE.match(answer):
+        return True
+    header_hits = sum(
+        1
+        for header in ("Requirements", "Preferred", "Salary range")
+        if _extract_section_block(answer, header=header) != _NA
+    )
+    return header_hits >= 2
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    stripped = text.strip()
+
+    try:
+        maybe = json.loads(stripped)
+        if isinstance(maybe, dict):
+            return maybe
+    except Exception:
+        pass
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        try:
+            maybe = json.loads(fenced.group(1))
+            if isinstance(maybe, dict):
+                return maybe
+        except Exception:
+            pass
+
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(stripped):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(stripped[idx:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+def _normalize_llm_field(value: Any) -> str:
+    if value is None:
+        return _NA
+    text = str(value).strip()
+    if not text:
+        return _NA
+    lowered = text.lower()
+    if lowered in {"n/a", "na", "none", "null", "unknown", "not specified"}:
+        return _NA
+    return text
+
+
+def _normalize_workplace_type(value: Any) -> str:
+    text = _normalize_llm_field(value).lower()
+    if text == _NA.lower():
+        return _NA
+    if "hybrid" in text:
+        return "hybrid"
+    if "remote" in text:
+        return "remote"
+    if "on-site" in text or "onsite" in text or "office" in text:
+        return "on-site"
+    return _NA
+
+
+def _normalize_employment_type(value: Any) -> str:
+    text = _normalize_llm_field(value).lower()
+    if text == _NA.lower():
+        return _NA
+    for label in ("full-time", "part-time", "contract", "internship", "temporary"):
+        if label in text:
+            return label
+    return _NA
+
+
+def _has_meaningful_llm_parse(fields: Dict[str, str]) -> bool:
+    if not isinstance(fields, dict):
+        return False
+    for key in ("company_name", "role_title", "requirements_summary"):
+        value = (fields.get(key) or "").strip()
+        if value and value != _NA:
+            return True
+    return False
+
+
+def _parse_jd_with_llm(answer: str) -> Dict[str, str]:
+    if not answer or answer == _NA:
+        return {}
+
+    hf_token = (os.getenv("HF_TOKEN") or "").strip()
+    if not hf_token:
+        return {}
+
+    hf_model = (os.getenv("HF_MODEL") or "meta-llama/Meta-Llama-3-70B-Instruct").strip()
+    urls = [
+        "https://router.huggingface.co/v1/chat/completions",
+        "https://api-inference.huggingface.co/v1/chat/completions",
+    ]
+    truncated = answer[:12000]
+    system_prompt = (
+        "You are a strict information extraction system. "
+        "Extract fields from a raw job description and return JSON only."
+    )
+    user_prompt = (
+        "Return VALID JSON ONLY with keys:\n"
+        "{\n"
+        '  "company_name": string,\n'
+        '  "role_title": string,\n'
+        '  "location": string,\n'
+        '  "workplace_type": "remote"|"hybrid"|"on-site"|"NA",\n'
+        '  "employment_type": "full-time"|"part-time"|"contract"|"internship"|"temporary"|"NA",\n'
+        '  "compensation_summary": string,\n'
+        '  "requirements_summary": string,\n'
+        '  "preferred_summary": string\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Use NA when a field is absent or uncertain.\n"
+        "- Keep text concise and do not invent details.\n"
+        "- Requirements/preferred summaries should be compact prose, not full bullet dumps.\n\n"
+        f"JOB_DESCRIPTION:\n{truncated}"
+    )
+    payload = {
+        "model": hf_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 700,
+        "temperature": 0.0,
+        "top_p": 1.0,
+    }
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json",
+    }
+
+    llm_text = ""
+    for url in urls:
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            if response.status_code >= 400:
+                continue
+            data = response.json()
+            llm_text = (
+                ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            ).strip()
+            if llm_text:
+                break
+        except Exception:
+            continue
+
+    parsed = _extract_first_json_object(llm_text)
+    if not isinstance(parsed, dict):
+        return {}
+
+    return {
+        "company_name": _normalize_llm_field(parsed.get("company_name")),
+        "role_title": _normalize_llm_field(parsed.get("role_title")),
+        "location": _normalize_llm_field(parsed.get("location")),
+        "workplace_type": _normalize_workplace_type(parsed.get("workplace_type")),
+        "employment_type": _normalize_employment_type(parsed.get("employment_type")),
+        "compensation_summary": _normalize_llm_field(parsed.get("compensation_summary")),
+        "requirements_summary": _normalize_llm_field(parsed.get("requirements_summary")),
+        "preferred_summary": _normalize_llm_field(parsed.get("preferred_summary")),
+    }
 
 
 def _extract_company_role_location(answer: str) -> Tuple[str, str, str]:

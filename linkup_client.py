@@ -358,14 +358,20 @@ class LinkupJobSearch:
         """
         return JobPostingIntake.from_selected_jd_payload(selected_jd_payload)
 
-    def research_from_selected_jd(self, selected_jd_payload: dict) -> dict:
+    def research_from_selected_jd(
+        self,
+        selected_jd_payload: dict,
+        *,
+        preferred_company: str | None = None,
+    ) -> dict:
         """
         Convenience method: build the intake and run company research using it as context.
         Missing fields remain literal "NA" (no re-search / enrichment).
         """
         intake = self.build_job_intake(selected_jd_payload)
 
-        company = intake.company_name if intake.company_name != "NA" else "NA"
+        preferred_company_clean = (preferred_company or "").strip()
+        company = intake.company_name if intake.company_name != "NA" else (preferred_company_clean or "NA")
         role = None if intake.role_title == "NA" else intake.role_title
         job_url = None if intake.job_url == "NA" else intake.job_url
         job_description = None if intake.answer == "NA" else intake.answer
@@ -519,7 +525,9 @@ Return all qualifying job links and details. Prioritize official {company_name} 
         existing_jd_text: str | None = None,
     ) -> dict:
         """
-        JD extraction from a specific job posting URL using LinkUp `/fetch` only.
+        JD extraction path for selected jobs.
+        This flow intentionally reuses already-extracted JD text from the
+        selected job payload and does not re-fetch the URL.
 
         Returns:
             {
@@ -551,76 +559,29 @@ Return all qualifying job links and details. Prioritize official {company_name} 
         print(f"existing_jd_len={len(existing_text)}")
         print(f"{'=' * 80}\n")
 
-        # Match LinkUp playground defaults to reduce latency and avoid JS-render timeouts.
-        payload = {
-            "url": url,
-            "outputFormat": "markdown",
-            "renderJS": False,
-            "includeRawHtml": False,
-            "extractImages": False,
-        }
-        req = urllib.request.Request(
-            "https://api.linkup.so/v1/fetch",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                body = resp.read().decode("utf-8", errors="ignore")
-        except Exception as e:
+        if existing_text:
+            print(f"\n{'=' * 80}")
+            print("🧭 DEBUG LOG: JD extraction reuse")
+            print("reason=use_existing_jd_payload")
+            print(f"job_url={url}")
+            print(f"existing_jd_len={len(existing_text)}")
+            print(f"{'=' * 80}\n")
             return {
-                "status": "error",
-                "error": f"LinkUp fetch failed: {type(e).__name__}: {e}",
-                "jd_text": "",
+                "status": "success",
+                "jd_text": existing_text[:12000],
                 "source_url": canonical_target or url,
-                "source_name": "",
+                "source_name": "existing_jd_payload",
             }
-
-        try:
-            parsed = json.loads(body)
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": f"LinkUp fetch returned non-JSON payload: {type(e).__name__}: {e}",
-                "jd_text": "",
-                "source_url": canonical_target or url,
-                "source_name": "",
-            }
-
-        content = (
-            parsed.get("content")
-            or parsed.get("markdown")
-            or ""
-        ).strip() if isinstance(parsed, dict) else ""
-        source_url = (
-            _canonicalize_url((parsed.get("url") or "").strip()) if isinstance(parsed, dict) else ""
-        ) or canonical_target or url
-        if not content:
-            return {
-                "status": "error",
-                "error": "LinkUp fetch returned empty content.",
-                "jd_text": "",
-                "source_url": source_url,
-                "source_name": "",
-            }
-
-        print(f"\n{'=' * 80}")
-        print("🧭 DEBUG LOG: JD extraction via LinkUp fetch")
-        print(f"source_url={source_url}")
-        print(f"content_len={len(content)}")
-        print(f"content_preview:\n{_preview_text(content, limit=2500)}")
-        print(f"{'=' * 80}\n")
 
         return {
-            "status": "success",
-            "jd_text": content[:12000],
-            "source_url": source_url,
-            "source_name": "linkup_fetch",
+            "status": "error",
+            "error": (
+                "Selected job did not include JD text in payload. "
+                "This path is configured to use payload JD only (no URL refetch)."
+            ),
+            "jd_text": "",
+            "source_url": canonical_target or url,
+            "source_name": "",
         }
 
     def get_company_profile(self, company: str, query: str | None = None, *, context: Optional[Dict[str, Any]] = None) -> dict:

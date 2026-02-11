@@ -266,12 +266,18 @@ def execute_company_profiler(params: dict) -> str:
                     "sources": merged_sources,
                 }
 
-        # Fallback: try extracting company from JD-intake payload
-        if not company or company == "NA":
-            if isinstance(job_intake_payload, dict) and job_intake_payload.get("answer"):
+        intake = None
+        if (
+            isinstance(job_intake_payload, dict)
+            and (job_intake_payload.get("answer") or "").strip()
+        ):
+            try:
                 intake = searcher.build_job_intake(job_intake_payload)
-                if getattr(intake, "company_name", None) and intake.company_name != "NA":
-                    company = intake.company_name
+                parsed_company = (getattr(intake, "company_name", "") or "").strip()
+                if parsed_company and parsed_company != "NA":
+                    company = parsed_company
+            except Exception:
+                intake = None
 
         if not company or company == "NA":
             return json.dumps(
@@ -294,22 +300,20 @@ def execute_company_profiler(params: dict) -> str:
             else []
         )
         intake_debug = {}
-        if jd_answer:
-            try:
-                intake = searcher.build_job_intake(job_intake_payload)
-                intake_debug = {
-                    "company_name": getattr(intake, "company_name", "NA"),
-                    "role_title": getattr(intake, "role_title", "NA"),
-                    "location": getattr(intake, "location", "NA"),
-                    "workplace_type": getattr(intake, "workplace_type", "NA"),
-                    "employment_type": getattr(intake, "employment_type", "NA"),
-                    "job_url": getattr(intake, "job_url", "NA"),
-                    "requirements_summary_len": len((getattr(intake, "requirements_summary", "") or "")),
-                    "preferred_summary_len": len((getattr(intake, "preferred_summary", "") or "")),
-                    "compensation_summary_len": len((getattr(intake, "compensation_summary", "") or "")),
-                }
-            except Exception as e:
-                intake_debug = {"intake_parse_error": f"{type(e).__name__}: {e}"}
+        if intake is not None:
+            intake_debug = {
+                "company_name": getattr(intake, "company_name", "NA"),
+                "role_title": getattr(intake, "role_title", "NA"),
+                "location": getattr(intake, "location", "NA"),
+                "workplace_type": getattr(intake, "workplace_type", "NA"),
+                "employment_type": getattr(intake, "employment_type", "NA"),
+                "job_url": getattr(intake, "job_url", "NA"),
+                "requirements_summary_len": len((getattr(intake, "requirements_summary", "") or "")),
+                "preferred_summary_len": len((getattr(intake, "preferred_summary", "") or "")),
+                "compensation_summary_len": len((getattr(intake, "compensation_summary", "") or "")),
+            }
+        elif jd_answer:
+            intake_debug = {"intake_parse_error": "intake parsing failed before research"}
 
         print(f"\n{'=' * 80}")
         print("🧭 DEBUG LOG: company_profiler JD context snapshot")
@@ -325,18 +329,27 @@ def execute_company_profiler(params: dict) -> str:
         profile = None
         sentiment = None
 
-        if isinstance(job_intake_payload, dict) and (job_intake_payload.get("answer") or "").strip():
+        if (
+            isinstance(job_intake_payload, dict)
+            and (job_intake_payload.get("answer") or "").strip()
+            and intake is not None
+        ):
             try:
                 print(f"\n{'=' * 80}")
                 print("🧭 DEBUG LOG: company_profiler using JD-aware path")
                 print(f"job_intake_answer_len={len((job_intake_payload.get('answer') or '').strip())}")
                 print(f"job_intake_sources={job_intake_payload.get('sources') or []}")
                 print(f"{'=' * 80}\n")
-                combined = searcher.research_from_selected_jd(job_intake_payload)
+                combined = searcher.research_from_selected_jd(
+                    job_intake_payload,
+                    preferred_company=company,
+                )
                 if isinstance(combined, dict):
                     profile = combined.get("profile")
                     sentiment = combined.get("sentiment")
-                    company = (combined.get("company") or company).strip()
+                    combined_company = (combined.get("company") or "").strip()
+                    if combined_company and combined_company != "NA":
+                        company = combined_company
             except Exception as e:
                 error_type = type(e).__name__
                 tb_text = traceback.format_exc().rstrip()
@@ -354,6 +367,8 @@ def execute_company_profiler(params: dict) -> str:
                 print(f"{'=' * 80}\n")
                 profile = None
                 sentiment = None
+        elif isinstance(job_intake_payload, dict) and (job_intake_payload.get("answer") or "").strip() and intake is None:
+            warnings.append("JD intake parsing failed before JD-aware profiling; using fallback profile path.")
 
         if profile is None or sentiment is None:
             print(f"\n{'=' * 80}")
