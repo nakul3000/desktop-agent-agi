@@ -48,3 +48,6 @@ memory.db
 .DS_Store
 Thumbs.db
 outputs/
+
+#cursor plans
+.cursor/
