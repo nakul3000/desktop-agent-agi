@@ -3,10 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
-from reportlab.lib.pagesizes import LETTER
-from reportlab.pdfbase import pdfmetrics
-from reportlab.lib.units import inch
-from reportlab.pdfgen import canvas
+try:
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.units import inch
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfgen import canvas
+
+    _REPORTLAB_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover
+    # Make PDF export an optional dependency so the app can still boot.
+    _REPORTLAB_AVAILABLE = False
 
 
 def export_resume_to_pdf_ats(
@@ -26,6 +32,18 @@ def export_resume_to_pdf_ats(
     - Standard fonts
     - Simple bullets
     """
+    if not _REPORTLAB_AVAILABLE:
+        raise ModuleNotFoundError(
+            "Missing optional dependency 'reportlab' required for PDF export.\n"
+            "\n"
+            "Install it with one of:\n"
+            "  - python -m pip install reportlab\n"
+            "  - conda install -c conda-forge reportlab\n"
+            "\n"
+            "If pip fails with an SSL certificate error on macOS/Anaconda, "
+            "prefer the conda-forge install."
+        )
+
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
