@@ -24,7 +24,7 @@ pip install -r requirements.txt
 pytest tests/test_email_handler.py -v
 ```
 
-Required env (see `.env.example`): `LINKUP_API_KEY`. Optional: `HF_TOKEN` (LLM), Gmail credentials for email features.
+Required env (see `.env.example`): `LINKUP_API_KEY`, `HF_TOKEN`. Optional: Gmail credentials for email features.
 
 ## Packaging notes
 - This repo currently ships without a `pyproject.toml` or `setup.py`. Use `requirements.txt` for dependencies or add your own packaging config if you need installs.
