@@ -4,8 +4,6 @@ Memory store for desktop agent demo.
 Currently provides:
 - SQLite schema creation via `init_db`.
 - Connection helpers with consistent row factory and ISO timestamps.
-
-Embeddings/semantic recall will live in `embeddings.py`.
 """
 
 from __future__ import annotations
@@ -131,20 +129,6 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         """
     )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS embeddings_map (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            user_id TEXT,
-            item_type TEXT NOT NULL,
-            item_id INTEGER NOT NULL,
-            text_for_embedding TEXT NOT NULL,
-            timestamp TEXT NOT NULL
-        );
-        """
-    )
-
     conn.commit()
 
     # Backfill helper: add user_id column if table pre-exists without it
@@ -154,7 +138,7 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         if column not in cols:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type};")
 
-    for tbl in ("turns", "artifacts", "facts", "refs", "embeddings_map"):
+    for tbl in ("turns", "artifacts", "facts", "refs"):
         _ensure_column(tbl, "user_id", "TEXT")
     # Ensure tool_name exists on turns
     _ensure_column("turns", "tool_name", "TEXT")
