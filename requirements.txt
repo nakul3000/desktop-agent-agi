@@ -1,16 +1,26 @@
-# Core dependencies for the agent
+# Core HTTP + utilities
 requests
 python-dotenv
-pytest
 typing-extensions
-linkup-sdk
-beautifulsoup4
 python-dateutil
-# LLM tool-calling client used by app.py
+beautifulsoup4
+
+# Testing
+pytest
+
+# HuggingFace LLM
 huggingface_hub
-# Gmail API (used by email_handler)
+
+# Linkup (correct SDK)
+linkup-sdk
+
+# PDF export (ATS resume)
+reportlab
+
+# Optional DOCX export (used in resume_tailor_agent)
+python-docx
+
+# Gmail API (email_handler)
 google-auth
 google-auth-oauthlib
 google-api-python-client
-reportlab
-huggingface_hub
