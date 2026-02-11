@@ -1679,5 +1679,56 @@ class EmailHandler:
         )
         return self._call_llm(prompt, "You are a professional recruiting communications assistant.")
 
-# Intentionally no standalone runner here.
-# This module is imported and orchestrated by the main agent flow.
+# ==========================================
+# EXAMPLE RUNNER
+# ==========================================
+if __name__ == "__main__":
+    print("Initializing Email Handler Agent...")
+    
+    # 1. Configuration
+    HF_TOKEN = os.getenv("HF_TOKEN")
+    if not HF_TOKEN:
+        # Optional fallback: read from local token.json (not the Gmail OAuth token file).
+        try:
+            with open("token.json", "r") as f:
+                data = json.load(f) or {}
+            HF_TOKEN = data.get("hf_token") or data.get("HF_TOKEN") or data.get("token")
+        except Exception:
+            HF_TOKEN = None
+
+    if not HF_TOKEN:
+        print("ERROR: Please set HF_TOKEN environment variable or add {\"hf_token\": \"...\"} to token.json.")
+        exit(1)
+        
+    # Initialize
+    agent = EmailHandler(hf_token=HF_TOKEN)
+    
+    # 2. Read Emails
+    print("\nFetching recent emails...")
+    messages = agent.list_emails(max_results=3)
+    
+    if not messages:
+        print("No emails found or auth failed.")
+    
+    for msg in messages:
+        print("\n" + "="*50)
+        
+        # Parse
+        email = agent.get_email_details(msg['id'])
+        print(f"SUBJECT: {email['subject']}")
+        print(f"FROM:    {email['sender']}")
+        
+        # Summarize
+        print("\n--- SUMMARY ---")
+        summary = agent.summarize_email(email)
+        print(summary)
+        
+        # Extract
+        print("\n--- EXTRACTION ---")
+        info = agent.extract_info(email)
+        print(json.dumps(info, indent=2))
+        
+        # Draft Reply
+        print("\n--- DRAFT REPLY ---")
+        reply = agent.draft_reply(email, research_context="I am free next Tuesday at 2 PM.")
+        print(reply)

@@ -36,6 +36,11 @@ wheels/
 .env
 .env.local
 
+# Local secrets / auth tokens
+token.json
+gmail_token.json
+credentials.json
+
 # Local SQLite database
 memory.db
 

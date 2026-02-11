@@ -3,9 +3,11 @@ requests
 python-dotenv
 pytest
 typing-extensions
-linkup
+linkup-sdk
 beautifulsoup4
 python-dateutil
+# LLM tool-calling client used by app.py
+huggingface_hub
 # Gmail API (used by email_handler)
 google-auth
 google-auth-oauthlib
