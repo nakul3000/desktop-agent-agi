@@ -1,139 +1,271 @@
-# Entry point for the personalized agent app
-from __future__ import annotations
-
-from dotenv import load_dotenv
-load_dotenv()
+# app.py — Multiturn Conversational Job Search Agent
+# Integrated with real Resume Tailor Agent
 
 import os
+import json
+import re
+import uuid
+from datetime import datetime
+from dotenv import load_dotenv
+from huggingface_hub import InferenceClient
 
-from agent_core import AgentCore
-from linkup_client import LinkupClient
-from memory import Memory
-from email_handler import EmailHandler
-from document_handler import DocumentHandler
-from calendar_handler import CalendarHandler
+import memory
 
-from agents.role_search_agent import recommend_jobs_for_resume
-from agents.job_description_agent import JobDescriptionRequest, fetch_sample_job_descriptions
+# 🔹 Import your real resume tailoring system
 from agents.resume_tailor_agent import TailorRequest, tailor_resume
 
+load_dotenv()
 
-def _require_env(key: str) -> str:
-    v = os.getenv(key)
-    if not v:
-        raise RuntimeError(f"Missing {key}. Add it to .env or export it in your shell.")
-    return v
+# ------------------------------------------------------------------ #
+# MEMORY INIT
+# ------------------------------------------------------------------ #
+
+_DB_INITIALIZED = False
 
 
-def run_resume_to_tailored_resume_flow():
-    """
-    Demo flow:
-    1) Recommend jobs from resume
-    2) User selects a job
-    3) Fetch JD samples via Linkup
-    4) User selects JD sample
-    5) Generate tailored resume (ATS PDF + optional DOCX)
-    """
-    resume_path = input("Enter resume path (e.g., samples/sample_data_analyst_resume.pdf): ").strip()
-    if not resume_path:
-        resume_path = "samples/sample_data_analyst_resume.pdf"
-
-    print("\nSearching jobs based on resume...\n")
-    rec = recommend_jobs_for_resume(
-        resume_path,
-        titles=["Software Engineer", "Data Analyst", "Data Engineer"],
-        location="United States",
-        remote_ok=True,
-        posted_within_days=60,
-        max_results=15,
-        top_k=3,
-    )
-
-    if rec.get("status") != "ok" or not rec["data"]["recommendations"]:
-        print("No recommendations found.")
-        print(rec.get("summary"))
+def _ensure_db_initialized():
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
         return
+    memory.init_db()
+    _DB_INITIALIZED = True
 
-    jobs = rec["data"]["recommendations"]
-    print("Top job recommendations:")
-    for i, j in enumerate(jobs, start=1):
-        print(f"{i}. {j['title']} — {j['company']} — {j.get('location')}")
-        print(f"   URL: {j['url']}")
-        print(f"   Match: {j.get('match_score')} | Matched skills: {', '.join(j.get('matched_skills', [])[:6])}")
-        print("")
 
-    choice = input(f"Pick a job (1-{len(jobs)}): ").strip()
-    idx = int(choice) - 1 if choice.isdigit() else 0
-    idx = max(0, min(idx, len(jobs) - 1))
-    selected_job = jobs[idx]
+# ------------------------------------------------------------------ #
+# TOOL DEFINITIONS
+# ------------------------------------------------------------------ #
 
-    print("\nFetching job description samples from Linkup...\n")
-    jd_samples = fetch_sample_job_descriptions(
-        JobDescriptionRequest(
-            title=selected_job["title"],
-            company=selected_job["company"],
-            location=selected_job.get("location"),
-            url=selected_job["url"],
-            max_variants=3,
+TOOLS = [
+    {
+        "name": "resume_tailor",
+        "description": "Tailor the user's resume for a specific job posting.",
+        "parameters": {
+            "role": "Target job role",
+            "company": "Target company",
+            "job_description": "Full job description text",
+        },
+    },
+]
+
+TOOL_NAMES = [t["name"] for t in TOOLS]
+
+# ------------------------------------------------------------------ #
+# SYSTEM PROMPT
+# ------------------------------------------------------------------ #
+
+SYSTEM_PROMPT = f"""
+You are JobAgent AI, an intelligent job search assistant.
+Today's date is {datetime.now().strftime("%B %d, %Y")}.
+
+You have access to this tool:
+
+1. resume_tailor – Use when the user wants to tailor or fine-tune their resume.
+
+IMPORTANT TOOL RULES:
+- When calling a tool, respond ONLY with valid JSON in this format:
+
+{{
+  "tool": "resume_tailor",
+  "parameters": {{
+    "role": "Role name",
+    "company": "Company name",
+    "job_description": "Full job description"
+  }},
+  "reasoning": "Why you're calling this tool"
+}}
+
+If required parameters are missing, ask the user first.
+Never hallucinate job descriptions.
+"""
+
+
+# ------------------------------------------------------------------ #
+# REAL TOOL IMPLEMENTATION
+# ------------------------------------------------------------------ #
+
+def execute_resume_tailor(params: dict) -> str:
+    """Executes your real resume tailoring agent."""
+
+    role = params.get("role")
+    company = params.get("company")
+    jd = params.get("job_description")
+
+    if not jd:
+        return json.dumps({
+            "status": "error",
+            "message": "Missing job_description. Please provide full job description text."
+        }, indent=2)
+
+    resume_path = os.getenv("DEFAULT_RESUME_PATH", "samples/sample_data_analyst_resume.pdf")
+
+    try:
+        result = tailor_resume(
+            TailorRequest(
+                resume_path=resume_path,
+                job_description=jd,
+                job_title=role,
+                company=company,
+                output_pdf_path="outputs/tailored_resume_ats.pdf"
+            )
         )
-    )
 
-    samples = jd_samples.get("data", {}).get("samples", [])
-    if not samples:
-        print("No job description samples found.")
-        print(jd_samples.get("summary"))
-        return
+        return json.dumps({
+            "status": "success",
+            "summary": result.get("summary"),
+            "output_pdf_path": result.get("data", {}).get("output_pdf_path"),
+            "preview": result.get("data", {}).get("tailored_resume_text", "")[:1200]
+        }, indent=2)
 
-    print(jd_samples["summary"])
-    for i, s in enumerate(samples, start=1):
-        src = s.get("source") or "unknown"
-        text_preview = s.get("job_description", "")[:900]
-        print(f"\n--- Sample {i} (source: {src}) ---\n{text_preview}\n")
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": str(e)
+        }, indent=2)
 
-    choice2 = input(f"Pick a job description sample (1-{len(samples)}): ").strip()
-    idx2 = int(choice2) - 1 if choice2.isdigit() else 0
-    idx2 = max(0, min(idx2, len(samples) - 1))
-    chosen_jd = samples[idx2]["job_description"]
 
-    # Outputs
-    out_pdf = input("Output ATS PDF path (enter to skip, e.g., outputs/tailored_resume_ats.pdf): ").strip() or None
-    out_docx = input("Output DOCX path (enter to skip, e.g., outputs/tailored_resume.docx): ").strip() or None
+TOOL_EXECUTORS = {
+    "resume_tailor": execute_resume_tailor,
+}
 
-    print("\nGenerating tailored resume...\n")
-    tailored = tailor_resume(
-        TailorRequest(
-            resume_path=resume_path,
-            job_description=chosen_jd,
-            job_title=selected_job["title"],
-            company=selected_job["company"],
-            location=selected_job.get("location"),
-            output_pdf_path=out_pdf,
-            output_docx_path=out_docx,
+
+# ------------------------------------------------------------------ #
+# AGENT CORE
+# ------------------------------------------------------------------ #
+
+class JobAgent:
+
+    def __init__(self):
+        self.hf_token = os.getenv("HF_TOKEN")
+        if not self.hf_token:
+            raise ValueError("HF_TOKEN not found in .env")
+
+        self.client = InferenceClient(
+            model="meta-llama/Meta-Llama-3-70B-Instruct",
+            token=self.hf_token,
         )
-    )
 
-    print(tailored["summary"])
-    print("\n---- Tailored Resume (preview) ----\n")
-    print(tailored["data"]["tailored_resume_text"][:2000])
+        self.conversation_history = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
 
-    if tailored["data"].get("output_pdf_path"):
-        print("\nATS PDF saved to:", tailored["data"]["output_pdf_path"])
-    if tailored["data"].get("output_docx_path"):
-        print("DOCX saved to:", tailored["data"]["output_docx_path"])
+        self.user_id = "anonymous"
+        self.session_id = str(uuid.uuid4())
 
+        _ensure_db_initialized()
+        memory.register_user(self.user_id)
+        memory.start_session(user_id=self.user_id, session_id=self.session_id)
+
+    # ------------------------------------------------------------------ #
+
+    def chat(self, user_message: str) -> str:
+
+        self.conversation_history.append({
+            "role": "user",
+            "content": user_message
+        })
+
+        memory.store_turn(self.session_id, role="user", text=user_message, user_id=self.user_id)
+
+        response = self._call_llm()
+        tool_call = self._parse_tool_call(response)
+
+        if tool_call:
+            tool_name = tool_call["tool"]
+            params = tool_call.get("parameters", {})
+
+            if tool_name in TOOL_EXECUTORS:
+                tool_result = TOOL_EXECUTORS[tool_name](params)
+
+                memory.store_turn(
+                    self.session_id,
+                    role="tool",
+                    text=str(tool_result),
+                    user_id=self.user_id,
+                    tool_name=tool_name
+                )
+
+                # Ask model to summarize tool result
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": f"[Tool Result]\n{tool_result}\n\nSummarize this for the user."
+                })
+
+                summary = self._call_llm()
+
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": summary
+                })
+
+                memory.store_turn(
+                    self.session_id,
+                    role="assistant",
+                    text=summary,
+                    user_id=self.user_id
+                )
+
+                return summary
+
+        # Normal response
+        self.conversation_history.append({
+            "role": "assistant",
+            "content": response
+        })
+
+        memory.store_turn(self.session_id, role="assistant", text=response, user_id=self.user_id)
+
+        return response
+
+    # ------------------------------------------------------------------ #
+
+    def _call_llm(self) -> str:
+        try:
+            response = self.client.chat_completion(
+                messages=self.conversation_history,
+                max_tokens=1000,
+                temperature=0.7,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"LLM Error: {str(e)}"
+
+    # ------------------------------------------------------------------ #
+
+    def _parse_tool_call(self, response: str) -> dict | None:
+        json_match = re.search(r'\{.*"tool".*\}', response, re.DOTALL)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group(0))
+                if parsed.get("tool") in TOOL_NAMES:
+                    return parsed
+            except Exception:
+                pass
+        return None
+
+
+# ------------------------------------------------------------------ #
+# CLI LOOP
+# ------------------------------------------------------------------ #
 
 def main():
-    api_key = _require_env("LINKUP_API_KEY")
+    print("=" * 60)
+    print("🤖 JobAgent AI — Resume Tailoring Enabled")
+    print("=" * 60)
+    print("\nType 'quit' to exit.\n")
 
-    linkup_client = LinkupClient(api_key=api_key)
-    memory = Memory()
-    email_handler = EmailHandler()
-    document_handler = DocumentHandler()
-    calendar_handler = CalendarHandler()
-    _agent = AgentCore(memory, linkup_client, email_handler, document_handler, calendar_handler)
+    agent = JobAgent()
 
-    print("Agent is running.\n")
-    run_resume_to_tailored_resume_flow()
+    while True:
+        user_input = input("You: ").strip()
+
+        if user_input.lower() == "quit":
+            print("Goodbye!")
+            break
+
+        print("\nAgent: ", end="")
+        response = agent.chat(user_input)
+        print(response)
+        print()
 
 
 if __name__ == "__main__":
