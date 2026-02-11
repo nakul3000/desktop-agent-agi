@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 
 import memory
+from linkup_client import LinkupJobSearch, normalize_search_results_to_jobs
 
 # One-time DB init guard
 _DB_INITIALIZED = False
@@ -129,44 +130,37 @@ def execute_job_searcher(params: dict) -> str:
     company = params.get("company", "")
     location = params.get("location", "United States")
 
-    # TODO: Replace with actual LinkupJobSearch call
-    # from linkup_client import LinkupJobSearch
-    # searcher = LinkupJobSearch()
-    # results = searcher.search_jobs(role, company, location)
-
-    # Stub response for testing
-    return json.dumps({
-        "status": "success",
-        "query": f"{role} at {company} in {location}",
-        "jobs_found": 3,
-        "jobs": [
+    try:
+        searcher = LinkupJobSearch()
+        response = searcher.search_jobs(role=role, company=company or None, location=location)
+        jobs = normalize_search_results_to_jobs(
+            response,
+            role=role,
+            company=company or None,
+            location=location,
+            limit=12,
+        )
+        results_count = len(getattr(response, "results", []) or [])
+        return json.dumps(
             {
-                "title": f"Senior {role}",
-                "company": company or "TechCorp",
-                "location": "San Francisco, CA",
-                "url": "https://careers.example.com/job/12345",
-                "salary": "$180K - $250K",
-                "posted": "2 days ago",
+                "status": "success",
+                "query": {"role": role, "company": company, "location": location},
+                "search_results_count": results_count,
+                "jobs_found": len(jobs),
+                "jobs": jobs,
+                "next_steps": "Reply with the number of a job to select it, then paste the full job description text.",
             },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
             {
-                "title": f"{role} - AI Platform",
-                "company": company or "TechCorp",
-                "location": "Seattle, WA (Hybrid)",
-                "url": "https://careers.example.com/job/12346",
-                "salary": "$160K - $220K",
-                "posted": "1 day ago",
+                "status": "error",
+                "error": str(e),
+                "query": {"role": role, "company": company, "location": location},
             },
-            {
-                "title": f"Staff {role}",
-                "company": company or "TechCorp",
-                "location": "Remote US",
-                "url": "https://careers.example.com/job/12347",
-                "salary": "$200K - $300K",
-                "posted": "Today",
-            },
-        ],
-        "next_steps": "I can research the company, tailor your resume, or draft a cover letter for any of these roles.",
-    }, indent=2)
+            indent=2,
+        )
 
 
 def execute_company_profiler(params: dict) -> str:

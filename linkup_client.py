@@ -1,7 +1,16 @@
-# Linkup API client for agentic search
+"""
+linkup_client.py
+
+Thin wrapper around LinkUp search plus helper normalization utilities.
+"""
+
 import os
+import re
 from datetime import datetime
+from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
+
 try:
     # SDK variant used in some Linkup versions
     from linkup import LinkupClient as SDKLinkupClient
@@ -11,6 +20,115 @@ except Exception:
 from company_research_agent import CompanyResearchAgent, JobPostingIntake
 
 load_dotenv()
+
+
+def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
+class _HTTPLinkupClient:
+    """
+    Fallback client when the `linkup` SDK isn't importable.
+
+    We intentionally fail fast with a clear message rather than silently misbehaving,
+    because LinkUp HTTP endpoints/auth can vary by account/version.
+    """
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def search(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(
+            "LinkUp SDK (`linkup` package) could not be imported. "
+            "Install/repair the `linkup` dependency so `LinkupClient.search(...)` is available."
+        )
+
+
+_LINE_KV_RE = re.compile(r"(?im)^\s*(company|employer|location|title|role)\s*:\s*(.+?)\s*$")
+
+
+def normalize_search_results_to_jobs(
+    response: Any,
+    *,
+    role: Optional[str] = None,
+    company: Optional[str] = None,
+    location: Optional[str] = None,
+    limit: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Convert LinkUp `searchResults` response into simple "job cards" for UI/CLI.
+
+    Since `searchResults` is not guaranteed to be structured as jobs, we do:
+    - one card per result
+    - best-effort extraction for company/location from result.content
+    - dedupe by URL
+    """
+
+    results = None
+    if isinstance(response, dict):
+        results = response.get("results")
+    if results is None:
+        results = _safe_getattr(response, "results", None)
+
+    if not isinstance(results, list):
+        return []
+
+    def extract_kv(content: str) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        if not content:
+            return out
+        for m in _LINE_KV_RE.finditer(content):
+            k = (m.group(1) or "").strip().lower()
+            v = (m.group(2) or "").strip()
+            if k and v and k not in out:
+                out[k] = v
+        return out
+
+    jobs: List[Dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for i, r in enumerate(results, start=1):
+        if len(jobs) >= limit:
+            break
+
+        name = None
+        url = None
+        content = ""
+
+        if isinstance(r, dict):
+            name = (r.get("name") or r.get("title") or "").strip() or None
+            url = (r.get("url") or "").strip() or None
+            content = (r.get("content") or r.get("snippet") or "").strip()
+        else:
+            name = (_safe_getattr(r, "name", None) or "").strip() or None
+            url = (_safe_getattr(r, "url", None) or "").strip() or None
+            content = (_safe_getattr(r, "content", None) or "").strip() or ""
+
+        if url and url in seen_urls:
+            continue
+        if url:
+            seen_urls.add(url)
+
+        kv = extract_kv(content)
+        inferred_company = company or kv.get("company") or kv.get("employer")
+        inferred_location = location or kv.get("location")
+        inferred_title = kv.get("title") or kv.get("role") or name or (role or "NA")
+
+        jobs.append(
+            {
+                "job_id": str(i),
+                "title": inferred_title or "NA",
+                "company": inferred_company or "NA",
+                "location": inferred_location or "NA",
+                "url": url or "NA",
+                "snippet": (content[:400] + ("…" if len(content) > 400 else "")) if content else "NA",
+            }
+        )
+
+    return jobs
 
 
 class LinkupJobSearch:
