@@ -36,15 +36,14 @@ Required env (see `.env.example`): `LINKUP_API_KEY`. Optional: `HF_TOKEN` (LLM),
 - Keeps artifacts: anything the agent produces or ingests (summaries, search results, drafts, research) is stored with who/what created it.
 - Stores facts: structured nuggets like deadlines, meetings, tasks, preferences—tagged with confidence and linked back to the artifact that revealed them.
 - Tracks references: when someone says “that deadline” or “the doc,” we remember what it pointed to for deterministic follow-ups.
-- Recency + structured recall: everything works via stored turns, artifacts, facts, and references (no vector index dependency).
+- Recency + structured recall: everything works via stored turns, artifacts, facts, and references.
 - User + session awareness: rows are scoped by session (and optionally user_id), so different users or runs don’t collide.
 - One-time init: `memory.init_db()` creates the SQLite schema; data lives on disk across runs (we ignore `memory.db` in git).
 
 ### Files and database
-- Files: `memory.py`, `utils.py`, `tests/test_memory_stub.py`.
+- Files: `memory.py`, `tests/test_memory_stub.py`.
 - Database: SQLite (`memory.db` by default). Call `init_db()` to create tables for turns, artifacts, facts, and references.
 - Persistence helpers: `store_turn`, `store_artifact`, `store_fact` write rows with ISO timestamps; they raise `RuntimeError` if a DB write fails.
-- Shared helpers: `utils.py` includes `load_resume_from_env` (reads resume text from `RESUME_PATH`) and `normalize_content`.
 - Tests: `tests/test_memory_stub.py` includes smoke tests for inserts/retrieval and asserts that insert helpers surface errors.
 - Data model (all scoped by `session_id`):
   - `turns`: every user/assistant/tool message with timestamp.
