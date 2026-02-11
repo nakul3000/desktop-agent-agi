@@ -5,12 +5,19 @@ import os
 import json
 import re
 import uuid
+import traceback
 from datetime import datetime
+from pathlib import Path
+import requests
 from dotenv import load_dotenv
-from huggingface_hub import InferenceClient
+try:
+    from huggingface_hub import InferenceClient
+except ModuleNotFoundError:
+    InferenceClient = None
 
 import memory
 from linkup_client import LinkupJobSearch, normalize_search_results_to_jobs
+from utils import load_resume_from_env
 
 # One-time DB init guard
 _DB_INITIALIZED = False
@@ -148,15 +155,25 @@ def execute_job_searcher(params: dict) -> str:
                 "search_results_count": results_count,
                 "jobs_found": len(jobs),
                 "jobs": jobs,
-                "next_steps": "Reply with the number of a job to select it, then paste the full job description text.",
+                "next_steps": "Reply with the number of a job to select it. If the JD text wasn't captured, you'll be prompted to paste it.",
             },
             indent=2,
         )
     except Exception as e:
+        error_type = type(e).__name__
+        tb_text = traceback.format_exc().rstrip()
+        print(f"\n{'=' * 80}")
+        print("❌ ERROR LOG: job_searcher failed")
+        print(f"Type: {error_type}")
+        print(f"Message: {e}")
+        print("Traceback:")
+        print(tb_text)
+        print(f"{'=' * 80}\n")
         return json.dumps(
             {
                 "status": "error",
                 "error": str(e),
+                "error_type": error_type,
                 "query": {"role": role, "company": company, "location": location},
             },
             indent=2,
@@ -165,29 +182,53 @@ def execute_job_searcher(params: dict) -> str:
 
 def execute_company_profiler(params: dict) -> str:
     """Execute company research — connects to your linkup_client.py"""
-    company = params.get("company", "Unknown")
+    context = params.get("context") or {}
+    selected_job = (context.get("selected_job") or {}) if isinstance(context, dict) else {}
+    job_intake_payload = (context.get("job_intake") or {}) if isinstance(context, dict) else {}
 
-    # TODO: Replace with actual LinkupJobSearch.get_company_profile() call
+    company = (params.get("company") or "").strip() or (selected_job.get("company") or "").strip()
 
-    return json.dumps({
-        "status": "success",
-        "company": company,
-        "profile": {
-            "overview": f"{company} is a leading technology company...",
-            "industry": "Technology",
-            "size": "10,000+ employees",
-            "headquarters": "San Francisco, CA",
-            "recent_news": [
-                f"{company} announced new AI research lab — Feb 2025",
-                f"{company} Q4 revenue beat expectations — Jan 2025",
-            ],
-            "tech_stack": ["Python", "PyTorch", "Kubernetes", "AWS"],
-            "culture": "Fast-paced, engineering-driven, strong ML focus",
-            "glassdoor_rating": "4.2/5",
-            "interview_difficulty": "Hard — expect system design + ML coding",
-        },
-        "next_steps": "Want me to tailor your resume for this company or search for open roles?",
-    }, indent=2)
+    try:
+        searcher = LinkupJobSearch()
+
+        # Fallback: try extracting company from JD-intake payload
+        if not company or company == "NA":
+            if isinstance(job_intake_payload, dict) and job_intake_payload.get("answer"):
+                intake = searcher.build_job_intake(job_intake_payload)
+                if getattr(intake, "company_name", None) and intake.company_name != "NA":
+                    company = intake.company_name
+
+        if not company or company == "NA":
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "Missing company. Provide params.company or select a job first (with company field).",
+                },
+                indent=2,
+            )
+
+        profile = searcher.get_company_profile(company, context=context if isinstance(context, dict) else None)
+        sentiment = searcher.get_company_sentiment(company, context=context if isinstance(context, dict) else None)
+
+        return json.dumps(
+            {
+                "status": "success",
+                "company": company,
+                "profile": profile,
+                "sentiment": sentiment,
+                "next_steps": "Want me to tailor your resume, draft a cover letter, or craft a recruiter message for the selected job?",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": str(e),
+                "company": company or "NA",
+            },
+            indent=2,
+        )
 
 
 def execute_resume_tailor(params: dict) -> str:
@@ -280,6 +321,12 @@ TOOL_EXECUTORS = {
 
 class JobAgent:
     def __init__(self, session_id: str | None = None, user_id: str | None = None):
+        if InferenceClient is None:
+            raise RuntimeError(
+                "Missing dependency: `huggingface_hub`.\n"
+                "Install it with: `pip install -r requirements.txt`"
+            )
+
         self.hf_token = os.getenv("HF_TOKEN")
         if not self.hf_token:
             raise ValueError("HF_TOKEN not found in .env")
@@ -288,9 +335,11 @@ class JobAgent:
         if not self.linkup_api_key:
             raise ValueError("LINKUP_API_KEY not found in .env")
 
+        # Allow overriding the HF model id via env var.
+        self.hf_model = os.getenv("HF_MODEL", "meta-llama/Meta-Llama-3-70B-Instruct")
         self.client = InferenceClient(
             # Use a hosted-inference-available model id
-            model="meta-llama/Meta-Llama-3-70B-Instruct",
+            model=self.hf_model,
             token=self.hf_token,
         )
 
@@ -312,20 +361,279 @@ class JobAgent:
         # Store context from tool results for downstream use
         self.context_store = {
             "last_jobs": None,
-            "last_company_profile": None,
+            "company_research": None,
+            "company_profile": None,
+            "company_sentiment": None,
             "last_resume_tailoring": None,
             "user_resume": None,
+            "selected_job": None,
+            "job_intake_payload": None,
         }
+
+        # CLI workflow state
+        self.awaiting_job_selection = False
+        self.awaiting_jd_text = False
+
+        # Best-effort: load resume text for downstream stubs/agents.
+        self.context_store["user_resume"] = load_resume_from_env() or None
+
+    def _build_context_envelope(self, *, user_request: str) -> dict:
+        selected_job = self.context_store.get("selected_job") or {}
+        job_intake_payload = self.context_store.get("job_intake_payload") or {}
+        return {
+            "session": {"session_id": self.session_id, "user_id": self.user_id},
+            "user_request": user_request,
+            "selected_job": selected_job,
+            "job_intake": job_intake_payload,
+            "artifacts": {
+                "last_jobs": self.context_store.get("last_jobs"),
+                "company_research": self.context_store.get("company_research"),
+                "company_profile": self.context_store.get("company_profile"),
+                "company_sentiment": self.context_store.get("company_sentiment"),
+                "last_resume_tailoring": self.context_store.get("last_resume_tailoring"),
+            },
+            "user": {"resume_text": self.context_store.get("user_resume")},
+        }
+
+    def _format_job_list_for_cli(self, jobs: list[dict]) -> str:
+        lines = []
+        for i, j in enumerate(jobs, start=1):
+            title = (j.get("title") or "NA").strip()
+            company = (j.get("company") or "NA").strip()
+            location = (j.get("location") or "NA").strip()
+            url = (j.get("url") or "NA").strip()
+            lines.append(f"{i}. {title} — {company} ({location})\n   {url}")
+        return "\n".join(lines)
+
+    def _load_sample_jd_text(self) -> str | None:
+        try:
+            here = Path(__file__).resolve().parent
+            return (here / "sample_jd1.txt").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+
+    def _normalize_tool_params(self, tool_name: str, params: dict | None) -> dict:
+        """Normalize common parameter aliases before tool execution."""
+        normalized = dict(params or {})
+        if tool_name == "job_searcher":
+            role_value = normalized.get("role")
+            if not (isinstance(role_value, str) and role_value.strip()):
+                for alias in ("job_title", "title", "position"):
+                    alias_value = normalized.get(alias)
+                    if isinstance(alias_value, str) and alias_value.strip():
+                        normalized["role"] = alias_value.strip()
+                        break
+        return normalized
+
+    def _execute_tool_and_respond(self, *, tool_name: str, params: dict, reasoning: str, user_message: str) -> str:
+        if tool_name not in TOOL_EXECUTORS:
+            error_msg = f"Unknown tool: {tool_name}. Available tools: {TOOL_NAMES}"
+            self.conversation_history.append({"role": "assistant", "content": error_msg})
+            memory.store_turn(self.session_id, role="assistant", text=error_msg, user_id=self.user_id)
+            return error_msg
+
+        params = self._normalize_tool_params(tool_name, params)
+        memory.store_turn(
+            self.session_id,
+            role="assistant",
+            text=f"[Tool call planned] {tool_name} {params}",
+            user_id=self.user_id,
+        )
+
+        params = dict(params or {})
+        params["context"] = self._build_context_envelope(user_request=user_message)
+
+        tool_result = TOOL_EXECUTORS[tool_name](params)
+        tool_turn_id = memory.store_turn(self.session_id, role="tool", text=str(tool_result), user_id=self.user_id, tool_name=tool_name)
+
+        self._update_context(tool_name, tool_result)
+        memory.store_artifact(
+            session_id=self.session_id,
+            type=tool_name,
+            content=tool_result,
+            source_turn_id=tool_turn_id,
+            created_by="JobAgent",
+            user_id=self.user_id,
+        )
+
+        self.conversation_history.append(
+            {
+                "role": "assistant",
+                "content": f"[Called tool: {tool_name}]\n{reasoning}",
+            }
+        )
+
+        # Special-case: after job search, return deterministic list for selection.
+        if tool_name == "job_searcher":
+            try:
+                parsed = json.loads(tool_result)
+            except Exception:
+                parsed = None
+
+            if isinstance(parsed, dict) and parsed.get("status") == "error":
+                error_type = parsed.get("error_type") or "ToolError"
+                error_text = parsed.get("error") or "Unknown job search error."
+                msg = (
+                    f"Job search failed with `{error_type}`: {error_text}\n\n"
+                    "I logged a detailed traceback in the terminal under "
+                    "`ERROR LOG: job_searcher failed`."
+                )
+                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                return msg
+
+            jobs = parsed.get("jobs") if isinstance(parsed, dict) else None
+            if isinstance(jobs, list) and jobs:
+                self.awaiting_job_selection = True
+                msg = "Here are the jobs I found. Reply with a number to select one:\n\n" + self._format_job_list_for_cli(jobs)
+                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                return msg
+            if self.client is None:
+                msg = (
+                    "I ran the job search, but didn’t get any structured job results back.\n"
+                    "Try a slightly different query (different company spelling, broader location, or a more common role title)."
+                )
+                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                return msg
+
+        # In CLI router mode (no LLM), return tool output directly.
+        if self.client is None:
+            msg = tool_result if isinstance(tool_result, str) else str(tool_result)
+            memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+            return msg
+
+        # Default: ask the LLM to summarize tool results.
+        self.conversation_history.append(
+            {
+                "role": "user",
+                "content": f"[Tool Result for {tool_name}]:\n{tool_result}\n\nNow summarize these results for the user in a helpful, conversational way. Highlight key findings and suggest logical next steps.",
+            }
+        )
+        summary = self._call_llm()
+        self.conversation_history.append({"role": "assistant", "content": summary})
+        memory.store_turn(self.session_id, role="assistant", text=summary, user_id=self.user_id)
+        return summary
 
     def chat(self, user_message: str) -> str:
         """Process a user message and return agent response."""
 
-        # Add user message to history
-        self.conversation_history.append({
-            "role": "user",
-            "content": user_message,
-        })
+        user_message = (user_message or "").strip()
+
+        # Always log the user turn, even for deterministic CLI intercepts.
+        self.conversation_history.append({"role": "user", "content": user_message})
         memory.store_turn(self.session_id, role="user", text=user_message, user_id=self.user_id)
+
+        # ---- Deterministic CLI workflow intercepts ----
+        if self.awaiting_job_selection and user_message.isdigit():
+            last_jobs = self.context_store.get("last_jobs") or {}
+            jobs = last_jobs.get("jobs") if isinstance(last_jobs, dict) else None
+            if not isinstance(jobs, list) or not jobs:
+                self.awaiting_job_selection = False
+                # fall through to normal flow
+            else:
+                idx = int(user_message)
+                if idx < 1 or idx > len(jobs):
+                    msg = f"Please reply with a number between 1 and {len(jobs)}."
+                    memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                    return msg
+
+                chosen = jobs[idx - 1]
+                chosen_jd = (chosen.get("jd_text") or "").strip() if isinstance(chosen, dict) else ""
+                self.context_store["selected_job"] = {
+                    "job_id": chosen.get("job_id") or str(idx),
+                    "title": chosen.get("title") or "NA",
+                    "company": chosen.get("company") or "NA",
+                    "location": chosen.get("location") or "NA",
+                    "url": chosen.get("url") or "NA",
+                    "jd_text": chosen_jd if chosen_jd and chosen_jd != "NA" else "",
+                }
+                self.awaiting_job_selection = False
+
+                # If we captured JD text from LinkUp search results, store it immediately.
+                selected_job = self.context_store.get("selected_job") or {}
+                selected_jd_text = (selected_job.get("jd_text") or "").strip() if isinstance(selected_job, dict) else ""
+                if selected_jd_text:
+                    self.context_store["job_intake_payload"] = {"answer": selected_jd_text, "sources": []}
+                    msg = (
+                        "Selected. I captured the job description text from search results.\n\n"
+                        "What do you want to do next?\n"
+                        "- research the company\n"
+                        "- tailor my resume\n"
+                        "- write a cover letter\n"
+                        "- message a recruiter"
+                    )
+                    memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                    return msg
+
+                # Otherwise ask the user to paste (or use sample).
+                self.awaiting_jd_text = True
+                msg = (
+                    "Selected. Now paste the full job description text for that role.\n\n"
+                    "Tip: type `sample_jd1` to use the repo sample JD."
+                )
+                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                return msg
+
+        if self.awaiting_jd_text:
+            jd_text = user_message
+            if user_message.lower() in {"sample_jd1", "use sample_jd1"}:
+                jd_text = self._load_sample_jd_text() or ""
+
+            if not jd_text:
+                msg = "I didn’t receive any JD text. Please paste the full job description (or type `sample_jd1`)."
+                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                return msg
+
+            selected_job = self.context_store.get("selected_job") or {}
+            if isinstance(selected_job, dict):
+                selected_job["jd_text"] = jd_text
+                self.context_store["selected_job"] = selected_job
+
+            self.context_store["job_intake_payload"] = {"answer": jd_text, "sources": []}
+            self.awaiting_jd_text = False
+
+            msg = (
+                "Got it. What do you want to do next?\n"
+                "- research the company\n"
+                "- tailor my resume\n"
+                "- write a cover letter\n"
+                "- message a recruiter"
+            )
+            memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+            return msg
+
+        # ---- Optional deterministic router after job selection + JD intake ----
+        selected_job = self.context_store.get("selected_job") or {}
+        has_selected_jd = isinstance(selected_job, dict) and bool((selected_job.get("jd_text") or "").strip())
+        if has_selected_jd:
+            lowered = user_message.lower()
+            if ("research" in lowered and "company" in lowered) or "company research" in lowered:
+                return self._execute_tool_and_respond(
+                    tool_name="company_profiler",
+                    params={},
+                    reasoning="User requested company research for the selected job.",
+                    user_message=user_message,
+                )
+            if "tailor" in lowered and "resume" in lowered:
+                return self._execute_tool_and_respond(
+                    tool_name="resume_tailor",
+                    params={},
+                    reasoning="User requested resume tailoring for the selected job.",
+                    user_message=user_message,
+                )
+            if "cover letter" in lowered:
+                return self._execute_tool_and_respond(
+                    tool_name="cover_letter_generator",
+                    params={},
+                    reasoning="User requested a cover letter for the selected job.",
+                    user_message=user_message,
+                )
+            if any(k in lowered for k in ("recruiter", "outreach", "cold email", "message")):
+                return self._execute_tool_and_respond(
+                    tool_name="email_crafter",
+                    params={"purpose": "cold_outreach"},
+                    reasoning="User requested a recruiter message for the selected job.",
+                    user_message=user_message,
+                )
 
         # Get LLM response
         response = self._call_llm()
@@ -335,7 +643,7 @@ class JobAgent:
 
         if tool_call:
             tool_name = tool_call["tool"]
-            params = tool_call.get("parameters", {})
+            params = tool_call.get("parameters", {}) or {}
             reasoning = tool_call.get("reasoning", "")
 
             print(f"\n🔧 Tool Selected: {tool_name}")
@@ -343,51 +651,12 @@ class JobAgent:
             print(f"💭 Reasoning: {reasoning}")
 
             # Execute the tool
-            if tool_name in TOOL_EXECUTORS:
-                memory.store_turn(self.session_id, role="assistant", text=f"[Tool call planned] {tool_name} {params}", user_id=self.user_id)
-                tool_result = TOOL_EXECUTORS[tool_name](params)
-                tool_turn_id = memory.store_turn(self.session_id, role="tool", text=str(tool_result), user_id=self.user_id, tool_name=tool_name)
-
-                # Store context
-                self._update_context(tool_name, tool_result)
-                # Persist artifact
-                memory.store_artifact(
-                    session_id=self.session_id,
-                    type=tool_name,
-                    content=tool_result,
-                    source_turn_id=tool_turn_id,
-                    created_by="JobAgent",
-                    user_id=self.user_id,
-                )
-
-                # Add tool call + result to conversation history
-                self.conversation_history.append({
-                    "role": "assistant",
-                    "content": f"[Called tool: {tool_name}]\n{reasoning}",
-                })
-                self.conversation_history.append({
-                    "role": "user",
-                    "content": f"[Tool Result for {tool_name}]:\n{tool_result}\n\nNow summarize these results for the user in a helpful, conversational way. Highlight key findings and suggest logical next steps.",
-                })
-
-                # Get LLM to summarize the tool results
-                summary = self._call_llm()
-
-                self.conversation_history.append({
-                    "role": "assistant",
-                    "content": summary,
-                })
-                memory.store_turn(self.session_id, role="assistant", text=summary, user_id=self.user_id)
-
-                return summary
-            else:
-                error_msg = f"Unknown tool: {tool_name}. Available tools: {TOOL_NAMES}"
-                self.conversation_history.append({
-                    "role": "assistant",
-                    "content": error_msg,
-                })
-                memory.store_turn(self.session_id, role="assistant", text=error_msg, user_id=self.user_id)
-                return error_msg
+            return self._execute_tool_and_respond(
+                tool_name=tool_name,
+                params=params,
+                reasoning=reasoning,
+                user_message=user_message,
+            )
         else:
             # No tool call — natural language response
             self.conversation_history.append({
@@ -399,6 +668,39 @@ class JobAgent:
 
     def _call_llm(self) -> str:
         """Call the HuggingFace Llama model."""
+        def _messages_to_prompt(msgs: list[dict]) -> str:
+            # Simple, deterministic chat-to-text prompt for text-generation fallback.
+            parts: list[str] = []
+            for m in msgs:
+                role = (m.get("role") or "").strip().upper()
+                content = (m.get("content") or "").strip()
+                if not role or not content:
+                    continue
+                parts.append(f"{role}:\n{content}\n")
+            parts.append("ASSISTANT:\n")
+            return "\n".join(parts)
+
+        def _call_router_chat_completions(msgs: list[dict]) -> str:
+            # OpenAI-compatible HF Router endpoint.
+            url = "https://router.huggingface.co/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {self.hf_token}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": self.hf_model,
+                "messages": msgs,
+                "max_tokens": 1024,
+                "temperature": 0.7,
+                "top_p": 0.9,
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=60)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"{resp.status_code} {resp.text}".strip())
+            data = resp.json()
+            return (data["choices"][0]["message"]["content"] or "").strip()
+
+        messages: list[dict] = []
         try:
             ctx = memory.get_context(self.session_id, user_id=self.user_id)
             messages = self.conversation_history + [
@@ -415,33 +717,85 @@ class JobAgent:
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            return f"⚠️ LLM Error: {str(e)}"
+            err = str(e)
+
+            # If default SDK call fails (including 410 on deprecated api-inference),
+            # try the current HF Router endpoint directly.
+            if (
+                ("api-inference.huggingface.co is no longer supported" in err)
+                or ("410" in err)
+                or ("Gone for url" in err)
+                or ("Inference Providers" in err)
+                or ("router.huggingface.co" in err)
+                or ("403 Forbidden" in err)
+            ):
+                try:
+                    return _call_router_chat_completions(messages)
+                except Exception as e2:
+                    err = f"{err}\nFallback (router chat) failed: {e2}"
+
+            # Final fallback: render a plain prompt and use text-generation.
+            try:
+                prompt = _messages_to_prompt(messages)
+                generated = self.client.text_generation(
+                    prompt,
+                    max_new_tokens=1024,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    stop_sequences=["\nUSER:", "\nSYSTEM:"],
+                )
+                if isinstance(generated, str):
+                    return generated.strip()
+                # If details=True ever gets enabled, handle output object.
+                return (generated.generated_text or "").strip()  # type: ignore[attr-defined]
+            except Exception as e3:
+                return f"⚠️ LLM Error: {err}\nFallback (text_generation) failed: {e3}"
 
     def _parse_tool_call(self, response: str) -> dict | None:
         """Extract tool call JSON from LLM response."""
-        # Try to find JSON block in response
-        # Pattern 1: ```json ... ```
-        json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
-        if json_match:
-            try:
-                parsed = json.loads(json_match.group(1))
-                if "tool" in parsed and parsed["tool"] in TOOL_NAMES:
-                    return parsed
-            except json.JSONDecodeError:
-                pass
+        def _validate_tool_payload(payload: object) -> dict | None:
+            if not isinstance(payload, dict):
+                return None
+            tool_name = payload.get("tool")
+            if isinstance(tool_name, str) and tool_name in TOOL_NAMES:
+                return payload
+            return None
 
-        # Pattern 2: Raw JSON in response
-        json_match = re.search(r'(\{"tool":\s*"[^"]+?".*?\})', response, re.DOTALL)
-        if json_match:
+        # Pattern 1: fenced JSON blocks (```json ...``` or plain ``` ... ```)
+        for match in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL | re.IGNORECASE):
             try:
-                parsed = json.loads(json_match.group(1))
-                if "tool" in parsed and parsed["tool"] in TOOL_NAMES:
-                    return parsed
+                parsed = json.loads(match.group(1))
             except json.JSONDecodeError:
-                pass
+                continue
+            valid = _validate_tool_payload(parsed)
+            if valid:
+                return valid
 
-        # Pattern 3: Look for tool name mentions as fallback
-        # (only if the response clearly indicates a tool should be called)
+        # Pattern 2: whole response is a JSON object
+        stripped = response.strip()
+        if stripped.startswith("{"):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            valid = _validate_tool_payload(parsed)
+            if valid:
+                return valid
+
+        # Pattern 3: scan for the first decodable JSON object anywhere in the response
+        decoder = json.JSONDecoder()
+        for idx, char in enumerate(response):
+            if char != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(response[idx:])
+            except json.JSONDecodeError:
+                continue
+            valid = _validate_tool_payload(parsed)
+            if valid:
+                return valid
+
         return None
 
     def _update_context(self, tool_name: str, result: str):
@@ -451,7 +805,10 @@ class JobAgent:
             if tool_name == "job_searcher":
                 self.context_store["last_jobs"] = parsed
             elif tool_name == "company_profiler":
-                self.context_store["last_company_profile"] = parsed
+                self.context_store["company_research"] = parsed
+                if isinstance(parsed, dict):
+                    self.context_store["company_profile"] = parsed.get("profile")
+                    self.context_store["company_sentiment"] = parsed.get("sentiment")
             elif tool_name == "resume_tailor":
                 self.context_store["last_resume_tailoring"] = parsed
         except json.JSONDecodeError:
