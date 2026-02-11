@@ -1,4 +1,6 @@
-# Linkup API client for agentic search
+# linkup_client.py
+# Thin Linkup SDK wrapper + functional helper used across agents.
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -9,14 +11,16 @@ try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
 except Exception:
-    # If python-dotenv isn't installed or .env not present, we just proceed.
     pass
 
 
 class LinkupClient:
     """
     Thin, stable wrapper around the Linkup SDK.
-    This keeps the rest of the codebase decoupled from SDK changes.
+
+    IMPORTANT:
+    - Keep this file small and stable.
+    - Put higher-level "job search pipelines" in separate modules (agents/, chat_agent_app.py, etc.)
     """
 
     def __init__(self, api_key: Optional[str] = None):
@@ -30,9 +34,7 @@ class LinkupClient:
         try:
             from linkup import LinkupClient as _SDKClient
         except Exception as e:
-            raise RuntimeError(
-                "Linkup SDK not installed. Run: pip install linkup-sdk"
-            ) from e
+            raise RuntimeError("Linkup SDK not installed. Run: pip install linkup-sdk") from e
 
         self._client = _SDKClient(api_key=self.api_key)
 
@@ -45,6 +47,7 @@ class LinkupClient:
         schema: Optional[Any] = None,        # pydantic BaseModel class for your SDK
         max_results: int = 10,
         recency_days: Optional[int] = None,  # kept for compatibility; enforce via prompt
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Execute an agentic search via Linkup.
@@ -53,22 +56,27 @@ class LinkupClient:
         Some linkup-sdk versions do NOT accept `recency_days`.
         We keep it in the interface but do not pass it to the SDK.
         Enforce recency in the query string instead.
+
+        kwargs:
+          - Some SDK versions accept extra params (e.g., include_images). We forward safely.
         """
         payload: Dict[str, Any] = {
             "query": query,
             "depth": depth,
             "max_results": max_results,
+            "output_type": output_type,
         }
 
-        _ = recency_days  # prompt-enforced
+        # prompt-enforced
+        _ = recency_days
 
         if output_type == "structured":
             if schema is None:
                 raise ValueError("schema is required when output_type='structured'")
-            payload["output_type"] = "structured"
             payload["structured_output_schema"] = schema
-        else:
-            payload["output_type"] = output_type
+
+        # Forward any optional SDK params if caller uses them
+        payload.update(kwargs)
 
         resp = self._client.search(**payload)
 
@@ -94,6 +102,7 @@ def linkup_search(
     schema: Optional[Any] = None,
     max_results: int = 10,
     recency_days: Optional[int] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     global _client
     if _client is None:
@@ -106,4 +115,6 @@ def linkup_search(
         schema=schema,
         max_results=max_results,
         recency_days=recency_days,
+        **kwargs,
     )
+    

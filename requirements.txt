@@ -1,5 +1,14 @@
 # Core dependencies for the agent
 requests
 python-dotenv
+
+# Linkup SDK
+linkup
+
+# Resume / document export
 reportlab
+
+# Testing & typing
+pytest
+typing-extensions
 

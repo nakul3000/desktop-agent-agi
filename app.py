@@ -1,10 +1,10 @@
 # Entry point for the personalized agent app
 from __future__ import annotations
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from agent_core import AgentCore
 from linkup_client import LinkupClient
@@ -45,11 +45,11 @@ def run_resume_to_tailored_resume_flow():
         location="United States",
         remote_ok=True,
         posted_within_days=60,
-        max_results=15,
+        max_results=40,
         top_k=3,
     )
 
-    if rec.get("status") != "ok" or not rec["data"]["recommendations"]:
+    if rec.get("status") != "ok" or not rec.get("data", {}).get("recommendations"):
         print("No recommendations found.")
         print(rec.get("summary"))
         return
@@ -84,10 +84,10 @@ def run_resume_to_tailored_resume_flow():
         print(jd_samples.get("summary"))
         return
 
-    print(jd_samples["summary"])
+    print(jd_samples.get("summary", "Retrieved job description samples."))
     for i, s in enumerate(samples, start=1):
         src = s.get("source") or "unknown"
-        text_preview = s.get("job_description", "")[:900]
+        text_preview = (s.get("job_description", "") or "")[:900]
         print(f"\n--- Sample {i} (source: {src}) ---\n{text_preview}\n")
 
     choice2 = input(f"Pick a job description sample (1-{len(samples)}): ").strip()
@@ -112,17 +112,18 @@ def run_resume_to_tailored_resume_flow():
         )
     )
 
-    print(tailored["summary"])
+    print(tailored.get("summary", "Done."))
     print("\n---- Tailored Resume (preview) ----\n")
-    print(tailored["data"]["tailored_resume_text"][:2000])
+    print((tailored.get("data", {}) or {}).get("tailored_resume_text", "")[:2000])
 
-    if tailored["data"].get("output_pdf_path"):
+    if (tailored.get("data", {}) or {}).get("output_pdf_path"):
         print("\nATS PDF saved to:", tailored["data"]["output_pdf_path"])
-    if tailored["data"].get("output_docx_path"):
+    if (tailored.get("data", {}) or {}).get("output_docx_path"):
         print("DOCX saved to:", tailored["data"]["output_docx_path"])
 
 
 def main():
+    # Keep your original components available (for future integration)
     api_key = _require_env("LINKUP_API_KEY")
 
     linkup_client = LinkupClient(api_key=api_key)
@@ -133,6 +134,8 @@ def main():
     _agent = AgentCore(memory, linkup_client, email_handler, document_handler, calendar_handler)
 
     print("Agent is running.\n")
+
+    # Default: run your resume-driven workflow
     run_resume_to_tailored_resume_flow()
 
 
