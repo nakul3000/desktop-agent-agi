@@ -1,4 +1,4 @@
-# desktop-agent-agi
+# Pathfind AI
 
 A local-first desktop agent that can search, summarize, and orchestrate tools -- built for the Hack with DC hackathon. It keeps a privacy-friendly memory (SQLite) of conversations, artifacts, and facts for better follow-ups.
 
