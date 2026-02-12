@@ -16,8 +16,12 @@ except ModuleNotFoundError:
     InferenceClient = None
 
 import memory
-from linkup_client import LinkupJobSearch, normalize_search_results_to_jobs
-from agents.resume_tailor_agent import TailorRequest, tailor_resume
+from linkup_client import LinkupJobSearch
+from company_research_agent import CompanyResearchAgent, JobPostingIntake
+from agents.resume_tailor_agent import TailorRequest, tailor_resume, _fetch_job_description_if_url
+from agents.role_search_agent import search_roles, RoleSearchQuery
+from job_searcher import JobSearcher
+from document_handler import DocumentHandler
 
 # from utils import load_resume_from_env
 
@@ -114,15 +118,15 @@ TOOLS = [
     },
     {
         "name": "email_crafter",
-        "description": "Draft a personalized cold outreach or follow-up email to recruiters or hiring managers. Uses company context for personalization.",
+        "description": "Draft a personalized email to a recruiter or hiring manager. Requires job description for context and optionally resume text for personalization.",
         "parameters": {
-            "recipient_name": "Name of the recruiter/hiring manager",
-            "recipient_role": "Their title (e.g., Senior Recruiter)",
-            "company": "Company name",
-            "role": "The role the user is interested in",
-            "purpose": "Purpose of email: cold_outreach, follow_up, thank_you, inquiry",
+            "job_description": "The job description text (required for context)",
+            "recipient_name": "Name of the recruiter/hiring manager (optional)",
+            "resume_text": "User's resume text for personalization (optional)",
+            "tone": "Email tone: professional (default), casual, or friendly",
+            "additional_context": "Any extra context (availability, specific achievements, etc.)",
         },
-        "triggers": ["email", "reach out", "contact recruiter", "cold email", "follow up", "outreach", "message recruiter"],
+        "triggers": ["email", "reach out", "contact recruiter", "cold email", "follow up", "outreach", "message recruiter", "draft email"],
     },
 ]
 
@@ -132,17 +136,21 @@ TOOL_NAMES = [t["name"] for t in TOOLS]
 # SYSTEM PROMPT
 # ------------------------------------------------------------------ #
 
-SYSTEM_PROMPT = f"""You are JobAgent AI, an intelligent job search and application assistant. Today's date is {datetime.now().strftime("%B %d, %Y")}.
+_TODAY = datetime.now().strftime("%B %d, %Y")
+SYSTEM_PROMPT = f"""You are JobAgent AI, an intelligent job search and application assistant. Today's date is {_TODAY}.
 
 You have access to these tools:
 
-1. **job_searcher** - Search for job openings. Use when user asks to find/search jobs.
-2. **company_profiler** - Research a company's background, culture, news. Use when user asks about a company.
-3. **resume_tailor** - Tailor resume for a specific role/company. Use when user wants to customize their resume.
+1. **job_searcher** - Search for job openings. Use when user asks to find/search jobs (e.g., "find me jobs about ML in Google" or "find ML/DS jobs").
+2. **resume_tailor** - Tailor resume for a specific job. If user says "tailor my resume," prompt for a job link, then pass the link to the resume_tailor agent for parsing and tailoring.
+3. **company_profiler** - Research a company's background, culture, news. Use when user asks about a company.
 4. **cover_letter_generator** - Write personalized cover letters. Use when user needs a cover letter.
 5. **email_crafter** - Draft outreach emails to recruiters. Use when user wants to email/contact someone.
 
 IMPORTANT RULES FOR TOOL CALLING:
+- If the query is about finding jobs (ML/DS, Google, etc.), call job_searcher.
+- If the user says "tailor my resume," ask for a job link, then pass it to resume_tailor for parsing and tailoring.
+- If the user selects a job from job_searcher, pass the job link to resume_tailor for tailoring.
 - When you need to use a tool, respond ONLY with a JSON block in this exact format:
 ```json
 {{
@@ -168,44 +176,79 @@ IMPORTANT RULES FOR TOOL CALLING:
 # ------------------------------------------------------------------ #
 
 def execute_job_searcher(params: dict) -> str:
-    """Execute job search — connects to your linkup_client.py"""
-    role = params.get("role", "Machine Learning Engineer")
+    """Execute job search using JobSearcher with structured output"""
+    
+    # Handle both structured params (role, company, location) and generic query
+    query_str = params.get("query", "")
+    role = params.get("role", "")
     company = params.get("company", "")
     location = params.get("location", "United States")
+    
+    # If we only have a generic query, parse it for role/company/location
+    if query_str and not role:
+        # Extract keywords from generic query
+        # e.g., "machine learning engineer jobs in google" -> role="machine learning engineer", company="google"
+        query_lower = query_str.lower()
+        
+        # Common company names
+        companies = ["google", "amazon", "microsoft", "meta", "apple", "netflix", "tesla", "stripe", "airbnb"]
+        
+        # Detect company
+        for comp in companies:
+            if comp in query_lower:
+                company = comp.capitalize()
+                role = query_str.replace(f"in {comp}", "").replace(f"at {comp}", "").replace("jobs", "").strip()
+                if not role:
+                    role = "Software Engineer"
+                break
+        
+        # If no company detected, use the query as role
+        if not role:
+            role = query_str if query_str else "Software Engineer"
+    
+    # Fallback
+    if not role:
+        role = "Machine Learning Engineer"
 
     try:
-        print(f"\n{'=' * 80}")
-        print("🧭 DEBUG LOG: execute_job_searcher input")
-        print(f"role={role!r} company={company!r} location={location!r}")
-        print(f"{'=' * 80}\n")
-        searcher = LinkupJobSearch()
-        response = searcher.search_jobs(role=role, company=company or None, location=location)
-        jobs = normalize_search_results_to_jobs(
-            response,
-            role=role,
-            company=company or None,
-            location=location,
-            limit=12,
-        )
-        results_count = len(getattr(response, "results", []) or [])
-        print(f"\n{'=' * 80}")
-        print("🧭 DEBUG LOG: execute_job_searcher output")
-        print(f"search_results_count={results_count} normalized_jobs_count={len(jobs)}")
-        for idx, j in enumerate(jobs, start=1):
-            jd_text = (j.get("jd_text") or "").strip()
-            print(
-                f"[job {idx}] title={j.get('title')} | company={j.get('company')} | location={j.get('location')} | "
-                f"url={j.get('url')} | jd_len={len(jd_text)}"
-            )
-        print(f"{'=' * 80}\n")
+        # Use JobSearcher with Linkup structured output
+        searcher = JobSearcher()
+        result_json = searcher.execute_search({
+            "role": role,
+            "company": company,
+            "location": location,
+        })
+        
+        # Parse the result
+        result = json.loads(result_json) if isinstance(result_json, str) else result_json
+        
+        # Extract jobs from response
+        jobs_list = []
+        if result.get("status") == "success":
+            response = result.get("response", {})
+            
+            # Handle structured output - response contains the schema output
+            if hasattr(response, "model_dump"):
+                response = response.model_dump()
+            
+            # Structured output returns jobs directly
+            if isinstance(response, dict):
+                jobs_list = response.get("jobs", [])
+            elif isinstance(response, str):
+                try:
+                    response_data = json.loads(response)
+                    jobs_list = response_data.get("jobs", [])
+                except:
+                    jobs_list = []
+        
         return json.dumps(
             {
                 "status": "success",
                 "query": {"role": role, "company": company, "location": location},
-                "search_results_count": results_count,
-                "jobs_found": len(jobs),
-                "jobs": jobs,
-                "next_steps": "Reply with the number of a job to select it. If the JD text wasn't captured, you'll be prompted to paste it.",
+                "search_results_count": len(jobs_list),
+                "jobs_found": len(jobs_list),
+                "jobs": jobs_list,
+                "next_steps": "Reply with the number of a job to select it." if jobs_list else "No jobs found. Try a different search query.",
             },
             indent=2,
         )
@@ -231,55 +274,16 @@ def execute_job_searcher(params: dict) -> str:
 
 
 def execute_company_profiler(params: dict) -> str:
-    """Execute company research — connects to your linkup_client.py"""
+    """Execute company research using CompanyResearchAgent for formatted markdown reports."""
     context = params.get("context") or {}
     selected_job = (context.get("selected_job") or {}) if isinstance(context, dict) else {}
-    job_intake_payload = (context.get("job_intake") or {}) if isinstance(context, dict) else {}
 
     company = (params.get("company") or "").strip() or (selected_job.get("company") or "").strip()
 
     warnings = []
     try:
         searcher = LinkupJobSearch()
-
-        if (
-            isinstance(job_intake_payload, dict)
-            and isinstance(selected_job, dict)
-            and selected_job.get("url")
-            and selected_job.get("url") != "NA"
-        ):
-            sources = job_intake_payload.get("sources")
-            has_url_source = isinstance(sources, list) and any(
-                isinstance(s, dict) and (s.get("url") or "").strip() == (selected_job.get("url") or "").strip()
-                for s in sources
-            )
-            if not has_url_source:
-                merged_sources = sources if isinstance(sources, list) else []
-                merged_sources.append(
-                    {
-                        "name": selected_job.get("title") or "Selected job posting",
-                        "url": selected_job.get("url"),
-                        "snippet": (selected_job.get("snippet") or "")[:300] or None,
-                        "favicon": None,
-                    }
-                )
-                job_intake_payload = {
-                    "answer": (job_intake_payload.get("answer") or "").strip(),
-                    "sources": merged_sources,
-                }
-
-        intake = None
-        if (
-            isinstance(job_intake_payload, dict)
-            and (job_intake_payload.get("answer") or "").strip()
-        ):
-            try:
-                intake = searcher.build_job_intake(job_intake_payload)
-                parsed_company = (getattr(intake, "company_name", "") or "").strip()
-                if parsed_company and parsed_company != "NA":
-                    company = parsed_company
-            except Exception:
-                intake = None
+        agent = CompanyResearchAgent(linkup_client=searcher.client)
 
         if not company or company == "NA":
             return json.dumps(
@@ -290,115 +294,51 @@ def execute_company_profiler(params: dict) -> str:
                 indent=2,
             )
 
-        # Debug trace: show which JD-aware inputs are available for profiling.
-        jd_answer = (
-            (job_intake_payload.get("answer") or "").strip()
-            if isinstance(job_intake_payload, dict)
-            else ""
-        )
-        jd_sources = (
-            job_intake_payload.get("sources")
-            if isinstance(job_intake_payload, dict)
-            else []
-        )
-        intake_debug = {}
-        if intake is not None:
-            intake_debug = {
-                "company_name": getattr(intake, "company_name", "NA"),
-                "role_title": getattr(intake, "role_title", "NA"),
-                "location": getattr(intake, "location", "NA"),
-                "workplace_type": getattr(intake, "workplace_type", "NA"),
-                "employment_type": getattr(intake, "employment_type", "NA"),
-                "job_url": getattr(intake, "job_url", "NA"),
-                "requirements_summary_len": len((getattr(intake, "requirements_summary", "") or "")),
-                "preferred_summary_len": len((getattr(intake, "preferred_summary", "") or "")),
-                "compensation_summary_len": len((getattr(intake, "compensation_summary", "") or "")),
-            }
-        elif jd_answer:
-            intake_debug = {"intake_parse_error": "intake parsing failed before research"}
+        print(f"\n🏢 Starting company research for: {company}")
 
-        print(f"\n{'=' * 80}")
-        print("🧭 DEBUG LOG: company_profiler JD context snapshot")
-        print(f"selected_job.company={selected_job.get('company') if isinstance(selected_job, dict) else 'NA'}")
-        print(f"selected_job.url={selected_job.get('url') if isinstance(selected_job, dict) else 'NA'}")
-        print(f"jd_payload_present={bool(jd_answer)}")
-        print(f"jd_answer_len={len(jd_answer)}")
-        print(f"jd_sources_count={len(jd_sources) if isinstance(jd_sources, list) else 0}")
-        print(f"jd_sources_urls={[((s.get('url') or '').strip()) for s in jd_sources if isinstance(s, dict)] if isinstance(jd_sources, list) else []}")
-        print(f"normalized_intake={json.dumps(intake_debug, indent=2)}")
-        print(f"{'=' * 80}\n")
+        # Extract role and job URL from selected job context if available
+        role = (selected_job.get("title") or selected_job.get("role") or "").strip() or None
+        job_url = (selected_job.get("url") or "").strip() or None
+        job_description = (selected_job.get("jd_text") or "").strip() or None
 
-        profile = None
-        sentiment = None
-
-        if (
-            isinstance(job_intake_payload, dict)
-            and (job_intake_payload.get("answer") or "").strip()
-            and intake is not None
-        ):
+        # Build job intake if we have JD text
+        job_intake = None
+        if job_description:
             try:
-                print(f"\n{'=' * 80}")
-                print("🧭 DEBUG LOG: company_profiler using JD-aware path")
-                print(f"job_intake_answer_len={len((job_intake_payload.get('answer') or '').strip())}")
-                print(f"job_intake_sources={job_intake_payload.get('sources') or []}")
-                print(f"{'=' * 80}\n")
-                combined = searcher.research_from_selected_jd(
-                    job_intake_payload,
-                    preferred_company=company,
-                )
-                if isinstance(combined, dict):
-                    profile = combined.get("profile")
-                    sentiment = combined.get("sentiment")
-                    combined_company = (combined.get("company") or "").strip()
-                    if combined_company and combined_company != "NA":
-                        company = combined_company
-            except Exception as e:
-                error_type = type(e).__name__
-                tb_text = traceback.format_exc().rstrip()
-                warning_message = (
-                    f"JD-aware profiling failed ({error_type}): {e}. "
-                    "Used fallback company/profile sentiment path."
-                )
-                warnings.append(warning_message)
-                print(f"\n{'=' * 80}")
-                print("⚠️ WARNING LOG: JD-aware company profiling path failed, using fallback path")
-                print(f"Type: {error_type}")
-                print(f"Message: {e}")
-                print("Traceback:")
-                print(tb_text)
-                print(f"{'=' * 80}\n")
-                profile = None
-                sentiment = None
-        elif isinstance(job_intake_payload, dict) and (job_intake_payload.get("answer") or "").strip() and intake is None:
-            warnings.append("JD intake parsing failed before JD-aware profiling; using fallback profile path.")
+                job_intake = JobPostingIntake.from_selected_jd_payload({
+                    "answer": job_description,
+                    "sources": [{"url": job_url, "name": selected_job.get("title", ""), "snippet": ""}] if job_url else [],
+                })
+            except Exception:
+                job_intake = None
 
-        if profile is None or sentiment is None:
-            print(f"\n{'=' * 80}")
-            print("🧭 DEBUG LOG: company_profiler using fallback non-JD path")
-            print(f"company={company}")
-            print(f"{'=' * 80}\n")
-            profile = searcher.get_company_profile(company, context=context if isinstance(context, dict) else None)
-            sentiment = searcher.get_company_sentiment(company, context=context if isinstance(context, dict) else None)
+        print("   📊 Fetching company profile & sentiment...")
+        combined = agent.research_company(
+            company=company,
+            role=role,
+            job_url=job_url,
+            job_description=job_description,
+            job_intake=job_intake,
+        )
+
+        profile = combined.get("profile", {})
+        sentiment = combined.get("sentiment", {})
+        final_company = (combined.get("company") or company).strip()
 
         payload = {
             "status": "success",
-            "company": company,
+            "company": final_company,
             "profile": _to_json_safe(profile),
             "sentiment": _to_json_safe(sentiment),
             "warnings": warnings,
-            "next_steps": "Want me to tailor your resume, draft a cover letter, or craft a recruiter message for the selected job?",
+            "next_steps": "Want me to tailor your resume, draft an email, or craft a recruiter message for the selected job?",
         }
+        print("   ✅ Company research complete!\n")
         return json.dumps(payload, indent=2)
     except Exception as e:
         error_type = type(e).__name__
         tb_text = traceback.format_exc().rstrip()
-        print(f"\n{'=' * 80}")
-        print("❌ ERROR LOG: company_profiler failed")
-        print(f"Type: {error_type}")
-        print(f"Message: {e}")
-        print("Traceback:")
-        print(tb_text)
-        print(f"{'=' * 80}\n")
+        print(f"\n❌ Company research failed: {e}\n")
         return json.dumps(
             {
                 "status": "error",
@@ -414,20 +354,31 @@ def execute_resume_tailor(params: dict) -> str:
     """
     Real resume tailoring using agents.resume_tailor_agent.
     Requires RESUME_PATH in .env (or pass params.resume_path).
+    Falls back to sample resume from samples/ folder if not found.
     Uses selected job's JD (context.selected_job.jd_text) if available.
     """
     try:
         context = params.get("context") or {}
         selected_job = (context.get("selected_job") or {}) if isinstance(context, dict) else {}
 
-        # 1) Resume path (required)
+        # 1) Resume path (required) — with fallback to samples folder
         resume_path = (params.get("resume_path") or os.getenv("RESUME_PATH") or "").strip()
-        if not resume_path:
+        
+        # Fallback: look for resume in samples folder if not provided
+        if not resume_path or not Path(resume_path).exists():
+            samples_dir = Path(__file__).resolve().parent / "samples"
+            if samples_dir.exists():
+                # Look for any PDF in samples folder
+                pdf_files = list(samples_dir.glob("*.pdf"))
+                if pdf_files:
+                    resume_path = str(pdf_files[0])
+        
+        if not resume_path or not Path(resume_path).exists():
             return json.dumps(
                 {
                     "status": "error",
                     "error": "Missing RESUME_PATH. Add RESUME_PATH=/absolute/path/to/resume.pdf in .env "
-                             "or pass { resume_path: ... } in tool parameters.",
+                             "or place a resume PDF in the samples/ folder.",
                 },
                 indent=2,
             )
@@ -505,13 +456,13 @@ def execute_cover_letter_generator(params: dict) -> str:
 
     return json.dumps({
         "status": "success",
-        "cover_letter": f"""Dear Hiring Team at {company},
+        "cover_letter": f"""Dear Hiring Team at Google,
 
-I am writing to express my interest in the {role} position at {company}. As an Applied ML Scientist at The Washington Post, I have built production AI systems serving 150K+ users, including multiturn RAG chatbots and enterprise AI partnerships worth $1.5M.
+I am writing to express my interest in the Software Engineer position at Google. I have experience building production AI systems and working with modern ML technologies.
 
 [This is a stub — the real implementation would use the LLM to generate a full personalized cover letter based on resume + company research + job description]
 
-I would welcome the opportunity to discuss how my experience aligns with {company}'s mission.
+I would welcome the opportunity to discuss how my experience aligns with Google's mission.
 
 Best regards,
 [Your Name]""",
@@ -520,30 +471,101 @@ Best regards,
 
 
 def execute_email_crafter(params: dict) -> str:
-    """Draft outreach email"""
-    recipient = params.get("recipient_name", "Hiring Manager")
-    company = params.get("company", "")
-    role = params.get("role", "")
-    purpose = params.get("purpose", "cold_outreach")
+    """Draft email to recruiter using email_handler"""
+    try:
+        # Get context with selected_job (if available)
+        context = params.get("context") or {}
+        selected_job = (context.get("selected_job") or {}) if isinstance(context, dict) else {}
 
-    return json.dumps({
-        "status": "success",
-        "email": {
-            "subject": f"Re: {role} Opportunity at {company}",
-            "to": recipient,
-            "body": f"""Hi {recipient},
+        # 1) Get job description
+        job_description = (params.get("job_description") or "").strip()
+        
+        # Fallback: use jd_text from selected_job (populated during job selection)
+        if not job_description and isinstance(selected_job, dict):
+            job_description = (selected_job.get("jd_text") or "").strip()
 
-I came across the {role} position at {company} and was excited to reach out. I'm currently an Applied ML Scientist at The Washington Post, where I've built production RAG systems serving 150K+ users.
+        # If still no JD, error
+        if not job_description:
+            return json.dumps({
+                "status": "error",
+                "error": "Missing job description. Select a job first or pass job_description parameter.",
+            }, indent=2)
 
-[Stub — real version would be personalized with company research + recruiter context]
+        # 2) Get recipient name
+        recipient_name = (params.get("recipient_name") or "Hiring Manager").strip()
 
-Would you have 15 minutes this week for a brief chat? I'm available [calendar slots would go here].
+        # 3) Get resume text
+        resume_text = (params.get("resume_text") or "").strip()
+        
+        # Fallback: load from RESUME_PATH
+        if not resume_text:
+            resume_path = os.getenv("RESUME_PATH")
+            if resume_path and os.path.exists(resume_path):
+                try:
+                    doc_handler = DocumentHandler()
+                    result = doc_handler.analyze(resume_path, doc_type="resume")
+                    if result.get("status") == "ok":
+                        resume_text = (result.get("data", {}).get("text") or "").strip()
+                except Exception:
+                    resume_text = ""
 
-Best,
-[Your Name]""",
-        },
-        "next_steps": "I can send this via Gmail API if you'd like, or refine the tone.",
-    }, indent=2)
+        # 4) Get tone and context
+        tone = (params.get("tone") or "professional").strip()
+        additional_context = (params.get("additional_context") or "").strip()
+
+        # Initialize email handler
+        from email_handler import EmailHandler
+        email_handler = EmailHandler(hf_token=os.getenv("HF_TOKEN"))
+
+        # Create thread_data for email_handler function
+        thread_data = {
+            "threadId": "",
+            "messages": [],
+            "latest": {
+                "subject": f"Inquiry: {selected_job.get('title', 'Position')} at {selected_job.get('company', 'Company')}",
+                "body": "",
+                "sender": "me",
+            },
+            "combined_body": "",
+        }
+
+        # Draft using email_handler
+        draft_body = email_handler.draft_reply_to_recruiter_thread(
+            thread_data=thread_data,
+            job_description=job_description,
+            resume_text=resume_text,
+            additional_context=additional_context,
+            tone=tone,
+        )
+
+        # Format subject based on selected job info
+        subject = f"Application: {selected_job.get('title', 'Position')} at {selected_job.get('company', 'Company')}"
+
+        return json.dumps({
+            "status": "success",
+            "email": {
+                "to": recipient_name,
+                "subject": subject,
+                "body": draft_body,
+            },
+            "next_steps": "Review the draft and let me know if you'd like me to send it or refine it.",
+        }, indent=2)
+
+    except Exception as e:
+        error_type = type(e).__name__
+        tb_text = traceback.format_exc().rstrip()
+        print(f"\n{'=' * 80}")
+        print("❌ ERROR LOG: email_crafter failed")
+        print(f"Type: {error_type}")
+        print(f"Message: {e}")
+        print("Traceback:")
+        print(tb_text)
+        print(f"{'=' * 80}\n")
+        return json.dumps({
+            "status": "error",
+            "error": f"{error_type}: {str(e)}",
+            "message": "Failed to draft email. Ensure HF_TOKEN is set and email_handler is properly configured.",
+        }, indent=2)
 
 
 # Tool dispatcher
@@ -614,6 +636,7 @@ class JobAgent:
         # CLI workflow state
         self.awaiting_job_selection = False
         self.awaiting_jd_text = False
+        self.awaiting_email_jd_link = False
 
         # Best-effort: load resume text for downstream stubs/agents.
         self.context_store["user_resume"] = None
@@ -639,11 +662,27 @@ class JobAgent:
     def _format_job_list_for_cli(self, jobs: list[dict]) -> str:
         lines = []
         for i, j in enumerate(jobs, start=1):
-            title = (j.get("title") or "NA").strip()
-            company = (j.get("company") or "NA").strip()
-            location = (j.get("location") or "NA").strip()
-            url = (j.get("url") or "NA").strip()
-            lines.append(f"{i}. {title} — {company} ({location})\n   {url}")
+            # Handle both field name formats (jobTitle vs title, companyName vs company, etc.)
+            title = (j.get("jobTitle") or j.get("title") or "N/A").strip()
+            company = (j.get("companyName") or j.get("company") or "N/A").strip()
+            location = (j.get("location") or "N/A").strip()
+            experience = (j.get("experienceLevel") or "").strip()
+            salary = (j.get("salaryRange") or "").strip()
+            url = (j.get("applicationUrl") or j.get("url") or "").strip()
+            
+            # Build info line
+            info = f"{i}. {title} — {company}"
+            if location and location != "N/A":
+                info += f" ({location})"
+            if experience:
+                info += f" [{experience}]"
+            if salary:
+                info += f" ${salary}"
+            
+            lines.append(info)
+            if url:
+                lines.append(f"   {url}")
+        
         return "\n".join(lines)
 
     def _next_action_prompt(self) -> str:
@@ -681,7 +720,8 @@ class JobAgent:
 
     def _extract_jd_from_selected_job_url(self, selected_job: dict | None) -> dict:
         selected_job = selected_job if isinstance(selected_job, dict) else {}
-        job_url = (selected_job.get("url") or "").strip()
+        # Handle both old (url) and new (applicationUrl) field names
+        job_url = (selected_job.get("url") or selected_job.get("applicationUrl") or "").strip()
         existing_jd_text = (selected_job.get("jd_text") or "").strip()
         if not job_url or job_url == "NA":
             return {"status": "error", "error": "No job URL available for extraction."}
@@ -750,8 +790,30 @@ class JobAgent:
                 "company profile",
                 "profile the company",
                 "tell me about the company",
+                "research about",
+                "tell me about",
+                "look up",
+                "what do you know about",
             )
         ) or ("research" in lowered and "company" in lowered)
+
+    def _extract_company_from_message(self, message: str) -> str:
+        """Try to extract a company name from a user message like 'research about Google'."""
+        lowered = (message or "").lower().strip()
+        # Patterns: 'research about X', 'tell me about X', 'look up X', 'research X'
+        for prefix in (
+            "research about", "tell me about", "look up",
+            "what do you know about", "profile", "research",
+        ):
+            if lowered.startswith(prefix):
+                candidate = message[len(prefix):].strip().rstrip(".!?")
+                # Remove trailing filler like "company", "the company"
+                for suffix in ("company", "the company", "the"):
+                    if candidate.lower().endswith(suffix):
+                        candidate = candidate[: -len(suffix)].strip()
+                if candidate:
+                    return candidate
+        return ""
 
     def _load_sample_jd_text(self) -> str | None:
         try:
@@ -770,6 +832,14 @@ class JobAgent:
                     alias_value = normalized.get(alias)
                     if isinstance(alias_value, str) and alias_value.strip():
                         normalized["role"] = alias_value.strip()
+                        break
+        if tool_name == "company_profiler":
+            company_value = normalized.get("company")
+            if not (isinstance(company_value, str) and company_value.strip()):
+                for alias in ("query", "name", "company_name"):
+                    alias_value = normalized.get(alias)
+                    if isinstance(alias_value, str) and alias_value.strip():
+                        normalized["company"] = alias_value.strip()
                         break
         return normalized
 
@@ -848,6 +918,76 @@ class JobAgent:
             memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
             return msg
 
+        if tool_name == "email_crafter":
+            # Show the actual drafted email, not an LLM summary
+            try:
+                parsed = json.loads(tool_result)
+                if isinstance(parsed, dict) and parsed.get("status") == "success":
+                    email_data = parsed.get("email", {})
+                    to = email_data.get("to", "Hiring Manager")
+                    subject = email_data.get("subject", "")
+                    body = email_data.get("body", "")
+                    next_steps = parsed.get("next_steps", "")
+
+                    message_parts = [
+                        "✅ Email drafted!\n",
+                        f"To: {to}",
+                        f"Subject: {subject}",
+                        "",
+                        "--- Draft Body ---",
+                        body,
+                        "--- End Draft ---",
+                        "",
+                    ]
+                    if next_steps:
+                        message_parts.append(next_steps)
+                    message_parts.append("\nYou can also say: 'tailor my resume' for this job.")
+                    msg = "\n".join(message_parts)
+                elif isinstance(parsed, dict) and parsed.get("status") == "error":
+                    error = parsed.get("error", "Unknown error")
+                    msg = f"❌ Email drafting failed: {error}"
+                else:
+                    msg = tool_result if isinstance(tool_result, str) else str(tool_result)
+            except json.JSONDecodeError:
+                msg = tool_result if isinstance(tool_result, str) else str(tool_result)
+            memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+            return msg
+
+        if tool_name == "resume_tailor":
+            # Format resume tailor output without a second LLM call
+            try:
+                parsed = json.loads(tool_result)
+                if isinstance(parsed, dict) and parsed.get("status") in ("success", "ok"):
+                    data = parsed.get("data", {})
+                    output_docx = data.get("output_docx_path") or parsed.get("output_docx_path", "N/A")
+                    output_pdf = data.get("output_pdf_path") or parsed.get("output_pdf_path", "N/A")
+                    message_parts = [
+                        "✅ Resume tailored successfully!",
+                        "",
+                        f"📄 Tailored Resume: {output_docx}",
+                        f"📋 ATS-Optimized PDF: {output_pdf}",
+                        "",
+                        "Next steps:",
+                        "1. Review the tailored resume",
+                        "2. Draft an email to the recruiter (say: 'draft an email')",
+                        "3. Research the company (say: 'research the company')",
+                    ]
+                    msg = "\n".join(message_parts)
+                elif isinstance(parsed, dict) and parsed.get("status") == "error":
+                    error = parsed.get("error", "Unknown error")
+                    error_type = parsed.get("error_type", "")
+                    if error_type:
+                        msg = f"❌ Resume tailoring failed ({error_type}): {error}"
+                    else:
+                        msg = f"❌ Resume tailoring failed: {error}"
+                else:
+                    status = parsed.get("status", "unknown")
+                    msg = f"❌ Resume tailoring failed: Status '{status}' - {parsed.get('summary', 'No summary available')}"
+            except json.JSONDecodeError:
+                msg = tool_result if isinstance(tool_result, str) else str(tool_result)
+            memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+            return msg
+
         # In CLI router mode (no LLM), return tool output directly.
         if self.client is None:
             msg = tool_result if isinstance(tool_result, str) else str(tool_result)
@@ -861,7 +1001,7 @@ class JobAgent:
                 "content": f"[Tool Result for {tool_name}]:\n{tool_result}\n\nNow summarize these results for the user in a helpful, conversational way. Highlight key findings and suggest logical next steps.",
             }
         )
-        summary = self._call_llm()
+        summary = self.intent_detector_call()
         self.conversation_history.append({"role": "assistant", "content": summary})
         memory.store_turn(self.session_id, role="assistant", text=summary, user_id=self.user_id)
         return summary
@@ -876,6 +1016,129 @@ class JobAgent:
         memory.store_turn(self.session_id, role="user", text=user_message, user_id=self.user_id)
 
         # ---- Deterministic CLI workflow intercepts ----
+        # Resume tailoring: prompt for job link if user mentions resume editing/tailoring
+        if any(phrase in user_message.lower() for phrase in ("tailor", "edit", "customize", "adapt", "modify", "update", "resume", "cv")):
+            if any(word in user_message.lower() for word in ("resume", "cv")):
+                # Check if JD already exists in context (from email flow or job selection)
+                existing_selected = self.context_store.get("selected_job") or {}
+                existing_jd = (existing_selected.get("jd_text") or "").strip() if isinstance(existing_selected, dict) else ""
+                if existing_jd:
+                    tailoring_msg = self._execute_tool_and_respond(
+                        tool_name="resume_tailor",
+                        params={
+                            "resume_path": os.getenv("RESUME_PATH", ""),
+                            "job_description": existing_jd,
+                            "job_title": existing_selected.get("title", ""),
+                            "company": existing_selected.get("company", ""),
+                            "location": existing_selected.get("location", ""),
+                        },
+                        reasoning="Using JD already in context from previous flow.",
+                        user_message=user_message,
+                    )
+                    memory.store_turn(self.session_id, role="assistant", text=tailoring_msg, user_id=self.user_id)
+                    return tailoring_msg
+                # Check if they provided a link in the same message
+                if "http" in user_message:
+                    # Extract the URL from the message
+                    import re as regex_module
+                    url_match = regex_module.search(r'https?://[^\s]+', user_message)
+                    if url_match:
+                        job_link = url_match.group(0)
+                        jd_text = _fetch_job_description_if_url(job_link)
+                        tailoring_msg = self._execute_tool_and_respond(
+                            tool_name="resume_tailor",
+                            params={
+                                "resume_path": os.getenv("RESUME_PATH", ""),
+                                "job_description": jd_text,
+                                "job_title": "",
+                                "company": "",
+                                "location": "",
+                            },
+                            reasoning="User provided job link with resume request.",
+                            user_message=user_message,
+                        )
+                        memory.store_turn(self.session_id, role="assistant", text=tailoring_msg, user_id=self.user_id)
+                        return tailoring_msg
+                # No link provided and no JD in context
+                self.awaiting_jd_text = True
+                msg = 'Please provide a link to the job role you want to tailor your resume for.'
+                memory.store_turn(self.session_id, role='assistant', text=msg, user_id=self.user_id)
+                return msg
+
+        # Handle awaiting job link after 'tailor my resume'
+        if getattr(self, 'awaiting_jd_text', False):
+            job_link = user_message.strip()
+            # Extract job description from link using linkup
+            jd_text = _fetch_job_description_if_url(job_link)
+            tailoring_msg = self._execute_tool_and_respond(
+                tool_name="resume_tailor",
+                params={
+                    "resume_path": os.getenv("RESUME_PATH", ""),
+                    "job_description": jd_text,
+                    "job_title": "",
+                    "company": "",
+                    "location": "",
+                },
+                reasoning="User provided job link for resume tailoring.",
+                user_message=user_message,
+            )
+            self.awaiting_jd_text = False
+            memory.store_turn(self.session_id, role="assistant", text=tailoring_msg, user_id=self.user_id)
+            return tailoring_msg
+        if self.awaiting_email_jd_link:
+            link = user_message.strip()
+            if not link or link.lower() in {"cancel", "skip"}:
+                self.awaiting_email_jd_link = False
+                msg = "Email drafting cancelled. What would you like to do next?"
+                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                return msg
+
+            # Use the same parser function that resume_tailor uses
+            try:
+                jd_text = _fetch_job_description_if_url(link)
+            except Exception as e:
+                jd_text = ""
+                print(f"\n{'=' * 80}")
+                print("🧭 DEBUG LOG: email flow -> JD parse failed")
+                print(f"error={type(e).__name__}: {e}")
+                print(f"{'=' * 80}\n")
+
+            if jd_text and len(jd_text) > 50:
+                print(f"\n{'=' * 80}")
+                print("🧭 DEBUG LOG: email flow -> JD parsed from link")
+                print(f"source_url={link}")
+                print(f"parsed_jd_len={len(jd_text)}")
+                print(f"{'=' * 80}\n")
+
+                self.awaiting_email_jd_link = False
+
+                # Store JD in selected_job so downstream tools (resume_tailor, etc.) can reuse it
+                self.context_store["selected_job"] = {
+                    "job_id": "",
+                    "title": "N/A",
+                    "company": "N/A",
+                    "location": "N/A",
+                    "url": link,
+                    "jd_text": jd_text,
+                }
+
+                # Call email_crafter with the parsed JD
+                email_msg = self._execute_tool_and_respond(
+                    tool_name="email_crafter",
+                    params={"job_description": jd_text},
+                    reasoning="User provided job link; parsed JD and drafting email.",
+                    user_message=user_message,
+                )
+                memory.store_turn(self.session_id, role="assistant", text=email_msg, user_id=self.user_id)
+                return email_msg
+
+            msg = (
+                "Could not extract a job description from that link.\n"
+                "Please provide a valid job posting URL, or paste the job description text directly."
+            )
+            memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+            return msg
+        
         if self.awaiting_job_selection and user_message.isdigit():
             last_jobs = self.context_store.get("last_jobs") or {}
             jobs = last_jobs.get("jobs") if isinstance(last_jobs, dict) else None
@@ -896,61 +1159,65 @@ class JobAgent:
                 print(f"user_selection_index={idx}")
                 print(f"chosen_job={json.dumps(chosen, indent=2)}")
                 print(f"{'=' * 80}\n")
+                
+                # Map both old field names (title, company, url) and new field names (jobTitle, companyName, applicationUrl)
                 self.context_store["selected_job"] = {
                     "job_id": chosen.get("job_id") or str(idx),
-                    "title": chosen.get("title") or "NA",
-                    "company": chosen.get("company") or "NA",
-                    "location": chosen.get("location") or "NA",
-                    "url": chosen.get("url") or "NA",
+                    "title": (chosen.get("jobTitle") or chosen.get("title") or "N/A").strip(),
+                    "company": (chosen.get("companyName") or chosen.get("company") or "N/A").strip(),
+                    "location": (chosen.get("location") or "N/A").strip(),
+                    "url": (chosen.get("applicationUrl") or chosen.get("url") or "N/A").strip(),
                     "jd_text": chosen_jd if chosen_jd and chosen_jd != "NA" else "",
                 }
                 self.awaiting_job_selection = False
 
                 selected_job = self.context_store.get("selected_job") or {}
+                job_url = (selected_job.get("url") or "").strip()
 
-                # Always try extracting from the selected link first so downstream profiling
-                # uses JD text that matches the exact posting the user chose.
+                # Try to extract JD text from the job URL
+                jd_text = ""
+
+                # First attempt: _extract_jd_from_selected_job_url (Linkup structured extraction)
                 extracted = self._extract_jd_from_selected_job_url(selected_job)
-                extracted_jd_text = (extracted.get("jd_text") or "").strip() if isinstance(extracted, dict) else ""
-                if isinstance(extracted, dict) and extracted.get("status") == "success" and extracted_jd_text:
-                    print(f"\n{'=' * 80}")
-                    print("🧭 DEBUG LOG: selection -> JD source decision")
-                    print("source=selected_job_url_extraction")
-                    print(f"extracted_source_url={(extracted.get('source_url') or '').strip()}")
-                    print(f"extracted_source_name={(extracted.get('source_name') or '').strip()}")
-                    print(f"extracted_jd_len={len(extracted_jd_text)}")
-                    print(f"extracted_jd_full={extracted_jd_text}")
-                    print(f"{'=' * 80}\n")
-                    selected_job["jd_text"] = extracted_jd_text
-                    extracted_source_url = (extracted.get("source_url") or "").strip()
-                    if extracted_source_url:
-                        selected_job["url"] = extracted_source_url
+                if isinstance(extracted, dict) and extracted.get("status") == "success":
+                    jd_text = (extracted.get("jd_text") or "").strip()
+
+                # Fallback: use _fetch_job_description_if_url (same parser as resume tailor)
+                if not jd_text and job_url and job_url != "N/A":
+                    try:
+                        jd_text = (_fetch_job_description_if_url(job_url) or "").strip()
+                    except Exception:
+                        jd_text = ""
+
+                # Use jobDescriptionSummary from search results as last resort
+                if not jd_text:
+                    jd_text = (chosen.get("jobDescriptionSummary") or "").strip()
+
+                if jd_text:
+                    selected_job["jd_text"] = jd_text
                     self.context_store["selected_job"] = selected_job
                     self.context_store["job_intake_payload"] = self._build_job_intake_payload(
-                        jd_text=extracted_jd_text,
+                        jd_text=jd_text,
                         selected_job=selected_job,
                     )
-                    msg = (
-                        "Selected. I extracted the job description from the job link.\n\n"
-                        + self._next_action_prompt()
-                    )
-                    memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
-                    return msg
 
-                extraction_error = (
-                    extracted.get("error")
-                    if isinstance(extracted, dict) and extracted.get("error")
-                    else "Unknown extraction error."
-                )
-                print(f"\n{'=' * 80}")
-                print("🧭 DEBUG LOG: selection -> JD source decision")
-                print("source=linkup_fetch_error_no_fallback")
-                print(f"url_extraction_error={extraction_error}")
-                print(f"{'=' * 80}\n")
-                msg = (
-                    "Selected, but JD extraction failed.\n\n"
-                    f"Error: {extraction_error}"
-                )
+                title = selected_job.get("title", "N/A")
+                company = selected_job.get("company", "N/A")
+                msg_parts = [f"Selected: **{title}** at **{company}**"]
+                if jd_text:
+                    msg_parts.append(f"Job description extracted ({len(jd_text)} chars).")
+                    msg_parts.append("")
+                    msg_parts.append("What would you like to do?")
+                    msg_parts.append("- 'tailor my resume' — tailor your resume for this role")
+                    msg_parts.append("- 'draft an email' — draft an outreach email")
+                    msg_parts.append("- 'research the company' — get company profile & sentiment")
+                else:
+                    msg_parts.append("Could not extract the full JD, but you can still:")
+                    msg_parts.append("- 'tailor my resume' with a job link")
+                    msg_parts.append("- 'draft an email' with a job link")
+                    msg_parts.append("- 'research the company'")
+
+                msg = "\n".join(msg_parts)
                 memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
                 return msg
 
@@ -984,20 +1251,36 @@ class JobAgent:
             memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
             return msg
 
-        # ---- Optional deterministic router after job selection + JD intake ----
+        # ---- Check for email drafting without a selected job ----
+        lowered = user_message.lower()
+        has_email_request = any(k in lowered for k in ("recruiter", "outreach", "cold email", "message", "email", "draft email"))
         selected_job = self.context_store.get("selected_job") or {}
         intake_payload = self.context_store.get("job_intake_payload") or {}
         has_selected_jd = isinstance(selected_job, dict) and bool((selected_job.get("jd_text") or "").strip())
         has_intake = isinstance(intake_payload, dict) and bool((intake_payload.get("answer") or "").strip())
-        if has_selected_jd or has_intake:
-            lowered = user_message.lower()
-            if self._is_company_research_request(user_message):
+
+        # ---- Standalone company research (no job selected) ----
+        if self._is_company_research_request(user_message):
+            company_from_msg = self._extract_company_from_message(user_message)
+            company_from_ctx = (selected_job.get("company") or "").strip() if isinstance(selected_job, dict) else ""
+            company = company_from_msg or company_from_ctx
+            if company and company.lower() not in ("na", "n/a", ""):
                 return self._execute_tool_and_respond(
                     tool_name="company_profiler",
-                    params={},
-                    reasoning="User requested company research for the selected job.",
+                    params={"company": company},
+                    reasoning=f"User requested company research for '{company}'.",
                     user_message=user_message,
                 )
+        
+        # If user asks for email but no job selected, ask for link
+        if has_email_request and not (has_selected_jd or has_intake):
+            self.awaiting_email_jd_link = True
+            msg = "I'd be happy to help you draft an email! Please provide the job posting link so I can extract the job description and personalize the email."
+            memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+            return msg
+        
+        # ---- Optional deterministic router after job selection + JD intake ----
+        if has_selected_jd or has_intake:
             if "tailor" in lowered and "resume" in lowered:
                 msg = (
                     "Resume tailoring is queued for the next phase. "
@@ -1014,17 +1297,16 @@ class JobAgent:
                 )
                 memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
                 return msg
-            if any(k in lowered for k in ("recruiter", "outreach", "cold email", "message")):
-                msg = (
-                    "Recruiter outreach drafting is queued for the next phase. "
-                    "For now I can run company profiling on your selected job. "
-                    "Say: 'research the company'."
+            if has_email_request:
+                return self._execute_tool_and_respond(
+                    tool_name="email_crafter",
+                    params={},
+                    reasoning="User requested to draft an email for the selected job.",
+                    user_message=user_message,
                 )
-                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
-                return msg
 
         # Get LLM response
-        response = self._call_llm()
+        response = self.intent_detector_call()
 
         # Check if the LLM wants to call a tool
         tool_call = self._parse_tool_call(response)
@@ -1033,10 +1315,6 @@ class JobAgent:
             tool_name = tool_call["tool"]
             params = tool_call.get("parameters", {}) or {}
             reasoning = tool_call.get("reasoning", "")
-
-            print(f"\n🔧 Tool Selected: {tool_name}")
-            print(f"📋 Parameters: {json.dumps(params, indent=2)}")
-            print(f"💭 Reasoning: {reasoning}")
 
             # Execute the tool
             return self._execute_tool_and_respond(
@@ -1054,8 +1332,8 @@ class JobAgent:
             memory.store_turn(self.session_id, role="assistant", text=response, user_id=self.user_id)
             return response
 
-    def _call_llm(self) -> str:
-        """Call the HuggingFace Llama model."""
+    def intent_detector_call(self) -> str:
+        """Intent detector and tool selector using LLM."""
         def _messages_to_prompt(msgs: list[dict]) -> str:
             # Simple, deterministic chat-to-text prompt for text-generation fallback.
             parts: list[str] = []
@@ -1091,10 +1369,12 @@ class JobAgent:
         messages: list[dict] = []
         try:
             ctx = memory.get_context(self.session_id, user_id=self.user_id)
-            messages = self.conversation_history + [
+            # Only use last 10 turns for context awareness (limit token usage)
+            recent_history = self.conversation_history[-20:] if len(self.conversation_history) > 20 else self.conversation_history
+            messages = recent_history + [
                 {
                     "role": "system",
-                    "content": f"Context packet (recent turns/artifacts/facts): {json.dumps(ctx)[:4000]}"
+                    "content": f"Context packet (recent turns/artifacts/facts): {json.dumps(ctx)[:2000]}"
                 }
             ]
             response = self.client.chat_completion(

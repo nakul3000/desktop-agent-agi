@@ -64,13 +64,14 @@ def _dedupe_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _extract_jobs_from_linkup_response(resp: Any) -> List[Dict[str, Any]]:
     """
-    Linkup SDK sometimes nests structured output under different keys.
-    This tries common shapes.
+    Extract jobs from Linkup searchResults response format.
+    Parse job title, company, and location from URLs and content.
     """
     if hasattr(resp, "model_dump"):
         resp = resp.model_dump()
 
     if isinstance(resp, dict):
+        # Try common shapes for structured output
         if isinstance(resp.get("jobs"), list):
             return resp["jobs"]
 
@@ -82,34 +83,119 @@ def _extract_jobs_from_linkup_response(resp: Any) -> List[Dict[str, Any]]:
         if isinstance(data, dict) and isinstance(data.get("jobs"), list):
             return data["jobs"]
 
-    return []
+    # Handle searchResults format (list of result objects)
+    results = resp.get("results") or resp.get("data") or resp.get("output") or []
+    
+    if isinstance(results, dict):
+        results = [results]
+    
+    jobs = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        
+        # Extract fields from search result
+        title = r.get("title") or r.get("name") or ""
+        url = r.get("url") or r.get("link") or ""
+        
+        # Skip if no title or URL
+        if not url:
+            continue
+        
+        if not title:
+            title = "Job Opening"
+        
+        # Extract content for summary and company detection
+        content = (
+            r.get("content") 
+            or r.get("text") 
+            or r.get("snippet") 
+            or r.get("summary")
+            or ""
+        )
+        
+        # Parse company from URL (e.g., "careers.google.com" -> "Google")
+        company = r.get("company") or r.get("source") or ""
+        if not company and url:
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(url).netloc.lower()
+                # Extract company from domain (careers.google.com -> google)
+                parts = domain.split('.')
+                if "careers" in parts[0]:
+                    company = parts[1].capitalize() if len(parts) > 1 else "Unknown"
+                elif parts[0] != "www":
+                    company = parts[0].capitalize()
+                else:
+                    company = parts[1].capitalize() if len(parts) > 1 else "Unknown"
+            except:
+                company = "Unknown"
+        
+        if not company:
+            company = "Unknown"
+        
+        job = {
+            "title": title.strip(),
+            "company": company.strip(),
+            "url": url.strip(),
+            "location": r.get("location") or _extract_location_from_content(content),
+            "remote": None,
+            "date_posted": r.get("date_posted") or r.get("date"),
+            "summary": content[:300].strip() if content else None,
+            "requirements": [],
+            "skills": [],
+            "source": url,
+        }
+        
+        jobs.append(job)
+    
+    return jobs
+
+
+def _extract_location_from_content(content: str) -> Optional[str]:
+    """Try to extract a location (city/state/country) from job content."""
+    if not content:
+        return None
+    
+    # Common location patterns (simple heuristic)
+    locations = [
+        "San Francisco", "New York", "Los Angeles", "Chicago", "Seattle",
+        "Austin", "Denver", "Boston", "Portland", "Remote", "Hybrid",
+        "US", "USA", "United States", "Canada", "UK", "Europe", "Asia"
+    ]
+    
+    content_lower = content.lower()
+    for loc in locations:
+        if loc.lower() in content_lower:
+            return loc
+    
+    # If nothing found, try to extract first capitalized phrase
+    for word in content.split():
+        if word[0].isupper() and len(word) > 3:
+            return word
+    
+    return None
 
 
 def search_roles(q: RoleSearchQuery) -> Dict[str, Any]:
-    titles_part = " OR ".join([f"\"{t}\"" for t in q.titles])
+    titles_part = " ".join(q.titles)
 
     kw_part = ""
     if q.keywords:
-        kw_part = " AND (" + " OR ".join([f"\"{k}\"" for k in q.keywords]) + ")"
+        kw_part = " " + " ".join(q.keywords)
 
-    remote_part = " remote" if q.remote_ok else ""
-    location_clause = f"in {q.location}" if q.location else ""
+    location_part = ""
+    if q.location:
+        location_part = f" {q.location}"
 
-    query = (
-        f"Find currently open job postings for {titles_part}{kw_part}{remote_part} {location_clause}. "
-        f"Only include roles posted in the last {q.posted_within_days} days if possible. "
-        f"Prefer official company career pages over aggregators (LinkedIn/Indeed OK only if needed). "
-        f"Open each job posting page and extract structured job fields. "
-        f"Return direct job posting URLs (not search result pages)."
-    )
+    # Simple, focused query for better results
+    query = f"Job postings for {titles_part}{kw_part}{location_part}"
 
     resp = linkup_search(
         query=query,
-        depth="deep",
-        output_type="structured",
-        schema=RoleSearchOutput,
+        depth="standard",
+        output_type="searchResults",
         max_results=q.max_results,
-        recency_days=q.posted_within_days,
     )
 
     jobs = _extract_jobs_from_linkup_response(resp)
