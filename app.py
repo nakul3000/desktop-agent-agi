@@ -128,6 +128,16 @@ TOOLS = [
         },
         "triggers": ["email", "reach out", "contact recruiter", "cold email", "follow up", "outreach", "message recruiter", "draft email"],
     },
+    {
+        "name": "recruiter_finder",
+        "description": "Find recruiter contact info (emails, LinkedIn) for a company and role, then draft a personalized outreach email. Uses Linkup to discover recruiters and LLM to compose the email.",
+        "parameters": {
+            "company": "The company to find recruiters at",
+            "role": "The role you're applying for",
+            "tone": "Email tone: professional (default) or friendly",
+        },
+        "triggers": ["find recruiter", "recruiter email", "recruiter contact", "who is hiring", "hiring manager", "find hiring", "get recruiter", "recruiter info"],
+    },
 ]
 
 TOOL_NAMES = [t["name"] for t in TOOLS]
@@ -137,7 +147,7 @@ TOOL_NAMES = [t["name"] for t in TOOLS]
 # ------------------------------------------------------------------ #
 
 _TODAY = datetime.now().strftime("%B %d, %Y")
-SYSTEM_PROMPT = f"""You are JobAgent AI, an intelligent job search and application assistant. Today's date is {_TODAY}.
+SYSTEM_PROMPT = f"""You are PathFind AI, an intelligent job search and application assistant. Today's date is {_TODAY}.
 
 You have access to these tools:
 
@@ -146,6 +156,7 @@ You have access to these tools:
 3. **company_profiler** - Research a company's background, culture, news. Use when user asks about a company.
 4. **cover_letter_generator** - Write personalized cover letters. Use when user needs a cover letter.
 5. **email_crafter** - Draft outreach emails to recruiters. Use when user wants to email/contact someone.
+6. **recruiter_finder** - Find recruiter contacts (emails, LinkedIn) at a company and draft a personalized outreach email. Use when user says "find recruiter", "recruiter emails", "who is hiring", etc.
 
 IMPORTANT RULES FOR TOOL CALLING:
 - If the query is about finding jobs (ML/DS, Google, etc.), call job_searcher.
@@ -568,6 +579,110 @@ def execute_email_crafter(params: dict) -> str:
         }, indent=2)
 
 
+def execute_recruiter_finder(params: dict) -> str:
+    """Find recruiter contacts and draft personalized outreach email."""
+    try:
+        context = params.get("context") or {}
+        selected_job = (context.get("selected_job") or {}) if isinstance(context, dict) else {}
+
+        company = (params.get("company") or "").strip() or (selected_job.get("company") or "").strip()
+        role = (params.get("role") or "").strip() or (selected_job.get("title") or "").strip()
+        tone = (params.get("tone") or "professional").strip()
+
+        if not company or company in ("NA", "N/A"):
+            return json.dumps({
+                "status": "error",
+                "error": "Missing company name. Select a job first or specify the company.",
+            }, indent=2)
+
+        if not role or role in ("NA", "N/A"):
+            return json.dumps({
+                "status": "error",
+                "error": "Missing role/title. Select a job first or specify the role.",
+            }, indent=2)
+
+        # Get job description
+        job_description = (params.get("job_description") or "").strip()
+        if not job_description and isinstance(selected_job, dict):
+            job_description = (selected_job.get("jd_text") or "").strip()
+
+        # Get resume text
+        resume_text = ""
+        resume_path = os.getenv("RESUME_PATH")
+        if resume_path and os.path.exists(resume_path):
+            try:
+                doc_handler = DocumentHandler()
+                result = doc_handler.analyze(resume_path, doc_type="resume")
+                if result.get("status") == "ok":
+                    resume_text = (result.get("data", {}).get("text") or "").strip()
+            except Exception:
+                resume_text = ""
+
+        # If no resume, try samples folder
+        if not resume_text:
+            samples_dir = Path(__file__).resolve().parent / "samples"
+            if samples_dir.exists():
+                pdf_files = list(samples_dir.glob("*.pdf"))
+                if pdf_files:
+                    try:
+                        doc_handler = DocumentHandler()
+                        result = doc_handler.analyze(str(pdf_files[0]), doc_type="resume")
+                        if result.get("status") == "ok":
+                            resume_text = (result.get("data", {}).get("text") or "").strip()
+                    except Exception:
+                        resume_text = ""
+
+        from email_handler import EmailHandler
+        email_handler = EmailHandler(hf_token=os.getenv("HF_TOKEN"))
+
+        if job_description and resume_text:
+            # Full pipeline: find recruiter + draft personalized email
+            print(f"\n🔍 Finding recruiters at {company} for {role}...")
+            print("   📧 Building outreach package (JD + resume + recruiter search)...")
+            package = email_handler.build_recruiter_outreach_package(
+                role_title=role,
+                job_description=job_description,
+                resume_text=resume_text,
+                company=company,
+                preferred_tone=tone,
+            )
+            print("   ✅ Recruiter outreach package ready!\n")
+            return json.dumps({
+                "status": "success",
+                "mode": "full_package",
+                "company": company,
+                "role": role,
+                "recruiter": package.get("recruiter", {}),
+                "email": {
+                    "subject": package.get("email_subject", ""),
+                    "body": package.get("email_body", ""),
+                },
+            }, indent=2)
+        else:
+            # Just find recruiter contacts (no email draft)
+            print(f"\n🔍 Finding recruiters at {company} for {role}...")
+            recruiter = email_handler.find_recruiter_contact(
+                company=company,
+                role_title=role,
+            )
+            print("   ✅ Recruiter search complete!\n")
+            return json.dumps({
+                "status": "success",
+                "mode": "contacts_only",
+                "company": company,
+                "role": role,
+                "recruiter": recruiter,
+            }, indent=2)
+
+    except Exception as e:
+        error_type = type(e).__name__
+        print(f"\n❌ Recruiter finder failed: {e}\n")
+        return json.dumps({
+            "status": "error",
+            "error": f"{error_type}: {str(e)}",
+        }, indent=2)
+
+
 # Tool dispatcher
 TOOL_EXECUTORS = {
     "job_searcher": execute_job_searcher,
@@ -575,6 +690,7 @@ TOOL_EXECUTORS = {
     "resume_tailor": execute_resume_tailor,
     "cover_letter_generator": execute_cover_letter_generator,
     "email_crafter": execute_email_crafter,
+    "recruiter_finder": execute_recruiter_finder,
 }
 
 
@@ -997,6 +1113,86 @@ class JobAgent:
             memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
             return msg
 
+        if tool_name == "recruiter_finder":
+            # Format recruiter finder output deterministically
+            try:
+                parsed = json.loads(tool_result)
+                if isinstance(parsed, dict) and parsed.get("status") == "success":
+                    company = parsed.get("company", "")
+                    role = parsed.get("role", "")
+                    recruiter = parsed.get("recruiter", {})
+                    email_data = parsed.get("email", {})
+                    mode = parsed.get("mode", "contacts_only")
+
+                    contacts = recruiter.get("contacts", [])
+                    primary_name = recruiter.get("name", "")
+                    primary_email = recruiter.get("email", "")
+                    confidence = recruiter.get("confidence", "low")
+                    linkedin_urls = recruiter.get("linkedin_urls", [])
+                    fallback = recruiter.get("fallback_suggestion", "")
+
+                    message_parts = [f"🔍 Recruiter Search: {role} at {company}", ""]
+
+                    if contacts:
+                        message_parts.append("📇 Contacts Found:")
+                        for i, c in enumerate(contacts, 1):
+                            name = c.get("name", "Unknown")
+                            title = c.get("title", "")
+                            email = c.get("email", "")
+                            linkedin = c.get("linkedin_url", "")
+                            line = f"  {i}. {name}"
+                            if title:
+                                line += f" — {title}"
+                            message_parts.append(line)
+                            if email:
+                                message_parts.append(f"     📧 {email}")
+                            if linkedin:
+                                message_parts.append(f"     🔗 {linkedin}")
+                        message_parts.append(f"\nConfidence: {confidence}")
+                    elif primary_name or primary_email:
+                        message_parts.append(f"📇 Best Contact: {primary_name or 'Unknown'}")
+                        if primary_email:
+                            message_parts.append(f"   📧 {primary_email}")
+                        if linkedin_urls:
+                            for url in linkedin_urls:
+                                message_parts.append(f"   🔗 {url}")
+                        message_parts.append(f"Confidence: {confidence}")
+                    else:
+                        message_parts.append("No specific recruiter contacts found.")
+
+                    if fallback:
+                        message_parts.append(f"\n💡 Tip: {fallback}")
+
+                    if mode == "full_package" and email_data:
+                        subject = email_data.get("subject", "")
+                        body = email_data.get("body", "")
+                        if body:
+                            message_parts.extend([
+                                "",
+                                "--- Draft Outreach Email ---",
+                                f"Subject: {subject}",
+                                "",
+                                body,
+                                "--- End Draft ---",
+                            ])
+
+                    message_parts.extend([
+                        "",
+                        "Next steps:",
+                        "- 'draft an email' — draft/refine an outreach email",
+                        "- 'tailor my resume' — tailor your resume for this role",
+                        "- 'research the company' — deep-dive into the company",
+                    ])
+                    msg = "\n".join(message_parts)
+                elif isinstance(parsed, dict) and parsed.get("status") == "error":
+                    msg = f"❌ Recruiter search failed: {parsed.get('error', 'Unknown error')}"
+                else:
+                    msg = tool_result if isinstance(tool_result, str) else str(tool_result)
+            except json.JSONDecodeError:
+                msg = tool_result if isinstance(tool_result, str) else str(tool_result)
+            memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+            return msg
+
         if tool_name == "resume_tailor":
             # Format resume tailor output without a second LLM call
             try:
@@ -1273,11 +1469,13 @@ class JobAgent:
                     msg_parts.append("What would you like to do?")
                     msg_parts.append("- 'tailor my resume' — tailor your resume for this role")
                     msg_parts.append("- 'draft an email' — draft an outreach email")
+                    msg_parts.append("- 'find recruiter' — find recruiter contacts & draft outreach")
                     msg_parts.append("- 'research the company' — get company profile & sentiment")
                 else:
                     msg_parts.append("Could not extract the full JD, but you can still:")
                     msg_parts.append("- 'tailor my resume' with a job link")
                     msg_parts.append("- 'draft an email' with a job link")
+                    msg_parts.append("- 'find recruiter' — find recruiter contacts")
                     msg_parts.append("- 'research the company'")
 
                 msg = "\n".join(msg_parts)
@@ -1314,9 +1512,30 @@ class JobAgent:
             memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
             return msg
 
-        # ---- Check for email drafting without a selected job ----
+        # ---- Check for recruiter finder request ----
         lowered = user_message.lower()
-        has_email_request = any(k in lowered for k in ("recruiter", "outreach", "cold email", "message", "email", "draft email"))
+        has_recruiter_request = any(k in lowered for k in (
+            "find recruiter", "recruiter email", "recruiter contact", "who is hiring",
+            "hiring manager", "find hiring", "get recruiter", "recruiter info",
+        ))
+        if has_recruiter_request:
+            selected_job = self.context_store.get("selected_job") or {}
+            company = (selected_job.get("company") or "").strip() if isinstance(selected_job, dict) else ""
+            role = (selected_job.get("title") or "").strip() if isinstance(selected_job, dict) else ""
+            if company and company not in ("NA", "N/A"):
+                return self._execute_tool_and_respond(
+                    tool_name="recruiter_finder",
+                    params={"company": company, "role": role},
+                    reasoning=f"User requested recruiter contacts for {company}.",
+                    user_message=user_message,
+                )
+            else:
+                msg = "Please select a job first (search and pick one), or tell me which company and role to find recruiters for."
+                memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+                return msg
+
+        # ---- Check for email drafting without a selected job ----
+        has_email_request = any(k in lowered for k in ("outreach", "cold email", "message", "email", "draft email"))
         selected_job = self.context_store.get("selected_job") or {}
         intake_payload = self.context_store.get("job_intake_payload") or {}
         has_selected_jd = isinstance(selected_job, dict) and bool((selected_job.get("jd_text") or "").strip())
@@ -1565,7 +1784,7 @@ class JobAgent:
 
 def main():
     print("=" * 60)
-    print("🤖 JobAgent AI — Intelligent Job Search Assistant")
+    print("🤖 PathFind AI — Intelligent Job Search Assistant")
     print("=" * 60)
     print("\nI can help you with:")
     print("  🔍 Search for jobs    → 'Find ML engineer jobs at Google'")

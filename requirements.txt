@@ -28,5 +28,5 @@ google-auth
 google-auth-oauthlib
 google-api-python-client
 
-# Web UI
+# Streamlit UI
 streamlit

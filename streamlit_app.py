@@ -1,357 +1,325 @@
 """
-Streamlit Chat UI for JobAgent with Memory Inspector.
-
-Run with:
-    streamlit run streamlit_app.py
+Streamlit frontend for PathFind AI — multiturn chatbot with tool-calling agent.
+Run with:  streamlit run streamlit_app.py
 """
 
+import os
+import sys
 import json
+import io
+import contextlib
 from pathlib import Path
 
 import streamlit as st
-import memory
-from app import JobAgent
+from dotenv import load_dotenv
+
+# Ensure project root is on sys.path so app.py imports resolve
+_PROJECT_ROOT = str(Path(__file__).resolve().parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+load_dotenv()
+
+from app import JobAgent  # noqa: E402
 
 # ------------------------------------------------------------------ #
 # Page config
 # ------------------------------------------------------------------ #
 
 st.set_page_config(
-    page_title="JobAgent AI",
+    page_title="PathFind AI",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ------------------------------------------------------------------ #
-# Custom CSS for a polished dark-themed chat UI
+# Custom CSS
 # ------------------------------------------------------------------ #
 
-st.markdown(
-    """
-    <style>
-    /* Hide default Streamlit branding */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
+st.markdown("""
+<style>
+    /* Compact header */
+    .block-container { padding-top: 2rem; }
 
-    /* Tighten up the top padding */
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 1rem;
-    }
+    /* Chat message styling */
+    .stChatMessage { max-width: 100%; }
 
-    /* Style the sidebar header */
-    [data-testid="stSidebar"] {
-        min-width: 340px;
-        max-width: 480px;
-    }
-
-    /* Memory table styling */
-    .memory-table {
-        font-size: 0.82rem;
-        width: 100%;
-    }
-
-    /* Badge styling for roles */
-    .role-user {
-        background-color: #7C3AED;
-        color: white;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 0.75rem;
-        font-weight: 600;
-    }
-    .role-assistant {
-        background-color: #1E1E2E;
-        color: #FAFAFA;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 0.75rem;
-        font-weight: 600;
-        border: 1px solid #333;
-    }
-    .role-tool {
-        background-color: #065F46;
-        color: #D1FAE5;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 0.75rem;
-        font-weight: 600;
-    }
-
-    /* Fact card */
-    .fact-card {
-        background: #1E1E2E;
-        border: 1px solid #333;
-        border-radius: 8px;
-        padding: 10px 14px;
-        margin-bottom: 8px;
-    }
-    .fact-key {
-        color: #7C3AED;
-        font-weight: 600;
-        font-size: 0.85rem;
-    }
-    .fact-value {
-        color: #FAFAFA;
-        font-size: 0.82rem;
-    }
-    .fact-meta {
+    /* Status / progress text inside chat */
+    .agent-status {
         color: #888;
-        font-size: 0.72rem;
-        margin-top: 4px;
+        font-size: 0.85em;
+        font-style: italic;
+        padding: 2px 0;
     }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+
+    /* Tool output blocks */
+    .tool-output {
+        background: #f8f9fa;
+        border-left: 3px solid #4A90D9;
+        padding: 12px 16px;
+        border-radius: 4px;
+        margin: 8px 0;
+        font-family: 'Segoe UI', sans-serif;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+    }
+
+    /* Job list cards */
+    .job-card {
+        background: #ffffff;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin: 6px 0;
+        transition: border-color 0.2s;
+    }
+    .job-card:hover { border-color: #4A90D9; }
+
+    /* Sidebar styling */
+    section[data-testid="stSidebar"] .block-container { padding-top: 1rem; }
+</style>
+""", unsafe_allow_html=True)
+
 
 # ------------------------------------------------------------------ #
-# Session-state initialisation
+# Session state initialization
 # ------------------------------------------------------------------ #
 
+def init_session_state():
+    """Initialize all session state variables."""
+    if "agent" not in st.session_state:
+        st.session_state.agent = JobAgent()
+    if "messages" not in st.session_state:
+        # Chat display history (separate from agent's internal history)
+        st.session_state.messages = []
+    if "processing" not in st.session_state:
+        st.session_state.processing = False
 
-def _init_agent() -> JobAgent:
-    """Create a fresh JobAgent and persist it in session state."""
-    agent = JobAgent()
-    return agent
 
-
-if "agent" not in st.session_state:
-    st.session_state.agent = _init_agent()
-
-if "messages" not in st.session_state:
-    # Each entry: {"role": "user" | "assistant", "content": str, "files": [...]}
-    st.session_state.messages = []
-
-if "downloadable_files" not in st.session_state:
-    # Tracks the latest downloadable files by type for the sidebar artifacts tab
-    # e.g. {"resume_docx": {...}, "resume_pdf": {...}, "research_pdf": {...}}
-    st.session_state.downloadable_files = {}
+init_session_state()
+agent: JobAgent = st.session_state.agent
 
 
 # ------------------------------------------------------------------ #
-# Sidebar  —  Controls + Memory Inspector
+# Sidebar
 # ------------------------------------------------------------------ #
 
 with st.sidebar:
-    st.markdown("## 🤖 JobAgent AI")
+    st.markdown("## 🤖 PathFind AI")
     st.caption("Intelligent Job Search Assistant")
+    st.divider()
+
+    st.markdown("### What I can do")
+    st.markdown("""
+    - 🔍 **Search jobs** — "Find ML jobs at Google"
+    - 🏢 **Research companies** — "Tell me about Anthropic"
+    - 📄 **Tailor resume** — "Tailor my resume for this role"
+    - ✉️ **Draft emails** — "Draft an email to the recruiter"
+    - 👤 **Find recruiters** — "Find recruiter at OpenAI"
+    """)
 
     st.divider()
 
-    # ---- Controls ------------------------------------------------ #
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🔄 Reset Chat", use_container_width=True):
-            st.session_state.agent.reset()
-            st.session_state.messages = []
-            st.session_state.downloadable_files = {}
-            st.rerun()
-    with col2:
-        refresh_memory = st.button("🔃 Refresh Memory", use_container_width=True)
+    # Context status
+    st.markdown("### 📦 Current Context")
+    selected_job = agent.context_store.get("selected_job") or {}
+    if isinstance(selected_job, dict) and selected_job.get("title") and selected_job["title"] != "N/A":
+        st.success(f"**Selected Job:** {selected_job.get('title', 'N/A')}")
+        st.caption(f"at {selected_job.get('company', 'N/A')}")
+        if selected_job.get("jd_text"):
+            st.caption(f"JD: {len(selected_job['jd_text'])} chars ✅")
+        else:
+            st.caption("JD: not extracted")
+    else:
+        st.info("No job selected yet")
+
+    last_jobs = agent.context_store.get("last_jobs") or {}
+    if isinstance(last_jobs, dict) and last_jobs.get("jobs"):
+        st.caption(f"Last search: {len(last_jobs['jobs'])} jobs found")
 
     st.divider()
 
-    # ---- Memory Inspector ---------------------------------------- #
-    st.markdown("### 🧠 Memory Inspector")
+    # Actions
+    if st.button("🔄 Reset Conversation", use_container_width=True):
+        agent.reset()
+        # Also reset awaiting flags
+        agent.awaiting_job_selection = False
+        agent.awaiting_jd_text = False
+        agent.awaiting_email_jd_link = False
+        st.session_state.messages = []
+        st.rerun()
 
-    agent: JobAgent = st.session_state.agent
-    session_id = agent.session_id
+    st.divider()
+    st.caption("Powered by Llama 3 70B + Linkup API")
 
-    tab_turns, tab_artifacts, tab_facts = st.tabs(["💬 Turns", "📦 Artifacts", "📌 Facts"])
 
-    # -- Turns tab ------------------------------------------------- #
-    with tab_turns:
-        turns = memory.get_turns_by_session(session_id)
-        if not turns:
-            st.info("No turns recorded yet. Start chatting!")
+# ------------------------------------------------------------------ #
+# Helper: capture stdout from agent (progress prints)
+# ------------------------------------------------------------------ #
+
+def run_agent_chat(user_input: str) -> tuple[str, str]:
+    """
+    Run agent.chat() and capture any stdout prints (progress messages)
+    separately from the returned response text.
+    Returns (response, captured_stdout).
+    """
+    stdout_capture = io.StringIO()
+    with contextlib.redirect_stdout(stdout_capture):
+        response = agent.chat(user_input)
+    return response, stdout_capture.getvalue()
+
+
+# ------------------------------------------------------------------ #
+# Helper: detect if response contains a job list for interactive selection
+# ------------------------------------------------------------------ #
+
+def is_job_list_response(response: str) -> bool:
+    """Check if the agent response is a numbered job list awaiting selection."""
+    return agent.awaiting_job_selection and "Reply with a number" in response
+
+
+def parse_job_list(response: str) -> tuple[str, list[dict]]:
+    """Split header text from job list, return jobs from context."""
+    jobs = []
+    last_jobs = agent.context_store.get("last_jobs") or {}
+    if isinstance(last_jobs, dict):
+        jobs = last_jobs.get("jobs", [])
+    header = response.split("\n")[0] if response else ""
+    return header, jobs
+
+
+# ------------------------------------------------------------------ #
+# Main chat area
+# ------------------------------------------------------------------ #
+
+st.markdown("# 🤖 PathFind AI")
+st.caption("Search jobs, research companies, tailor resumes, draft emails — all in one conversation.")
+
+# Display chat history
+for msg in st.session_state.messages:
+    role = msg["role"]
+    content = msg["content"]
+    with st.chat_message("user" if role == "user" else "assistant", avatar="👤" if role == "user" else "🤖"):
+        # Check if this message has special rendering
+        msg_type = msg.get("type", "text")
+
+        if msg_type == "job_list":
+            st.markdown(content)
+        elif msg_type == "progress":
+            st.markdown(f'<div class="agent-status">{content}</div>', unsafe_allow_html=True)
         else:
-            st.caption(f"{len(turns)} turn(s) in session")
-            for t in turns:
-                row = dict(t)
-                role = row.get("role", "unknown")
-                text = row.get("text", "")
-                ts = row.get("timestamp", "")
-
-                # Role badge
-                badge_class = {
-                    "user": "role-user",
-                    "assistant": "role-assistant",
-                    "tool": "role-tool",
-                }.get(role, "role-assistant")
-
-                tool_label = ""
-                if row.get("tool_name"):
-                    tool_label = f" &middot; <code>{row['tool_name']}</code>"
-
-                st.markdown(
-                    f'<span class="{badge_class}">{role}</span>{tool_label} '
-                    f'<span style="color:#666;font-size:0.7rem;">{ts}</span>',
-                    unsafe_allow_html=True,
-                )
-
-                # Show a truncated preview, expandable
-                preview = text[:200] + ("…" if len(text) > 200 else "")
-                if len(text) > 200:
-                    with st.expander(preview, expanded=False):
-                        st.text(text)
-                else:
-                    st.text(preview)
-
-    # -- Artifacts tab --------------------------------------------- #
-    with tab_artifacts:
-        # ---- Downloadable files section ---- #
-        dl_files = st.session_state.get("downloadable_files", {})
-        if dl_files:
-            st.markdown("#### 📥 Downloads")
-            for ftype, finfo in dl_files.items():
-                fpath = finfo.get("path", "")
-                if fpath and Path(fpath).exists():
-                    with open(fpath, "rb") as fp:
-                        st.download_button(
-                            label=finfo.get("label", "Download"),
-                            data=fp.read(),
-                            file_name=finfo.get("filename", Path(fpath).name),
-                            mime=finfo.get("mime", "application/octet-stream"),
-                            use_container_width=True,
-                            key=f"sidebar_dl_{ftype}",
-                        )
-            st.divider()
-
-        artifacts = memory.get_artifacts_by_session(session_id)
-        if not artifacts and not dl_files:
-            st.info("No artifacts stored yet.")
-        elif artifacts:
-            st.caption(f"{len(artifacts)} artifact(s)")
-            for a in artifacts:
-                row = dict(a)
-                art_type = row.get("type", "unknown")
-                content = row.get("content", "")
-                ts = row.get("timestamp", "")
-                created_by = row.get("created_by", "")
-
-                header = f"**{art_type}**"
-                if created_by:
-                    header += f"  ·  _{created_by}_"
-
-                with st.expander(header, expanded=False):
-                    st.caption(ts)
-                    # Try to render as JSON, fall back to plain text
-                    try:
-                        parsed = json.loads(content)
-                        st.json(parsed)
-                    except (json.JSONDecodeError, TypeError):
-                        st.text(content[:2000])
-
-    # -- Facts tab ------------------------------------------------- #
-    with tab_facts:
-        facts = memory.get_facts_by_session(session_id)
-        if not facts:
-            st.info("No facts extracted yet.")
-        else:
-            st.caption(f"{len(facts)} fact(s)")
-
-            # Optional kind filter
-            all_kinds = sorted(set(dict(f).get("kind", "") for f in facts))
-            if len(all_kinds) > 1:
-                selected_kind = st.selectbox(
-                    "Filter by kind",
-                    options=["all"] + all_kinds,
-                    index=0,
-                )
-            else:
-                selected_kind = "all"
-
-            for f in facts:
-                row = dict(f)
-                if selected_kind != "all" and row.get("kind") != selected_kind:
-                    continue
-
-                kind = row.get("kind", "")
-                key = row.get("key", "")
-                value = row.get("value", "")
-                confidence = row.get("confidence", 0)
-                ts = row.get("timestamp", "")
-
-                st.markdown(
-                    f"""<div class="fact-card">
-                        <div class="fact-key">{kind}: {key}</div>
-                        <div class="fact-value">{value}</div>
-                        <div class="fact-meta">confidence: {confidence:.0%} &middot; {ts}</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-
-# ------------------------------------------------------------------ #
-# Helper — render download buttons for a list of file dicts
-# ------------------------------------------------------------------ #
-
-def _render_download_buttons(files: list[dict], key_prefix: str = "dl"):
-    """Render download buttons for generated files inside a chat message."""
-    valid_files = [f for f in files if f.get("path") and Path(f["path"]).exists()]
-    if not valid_files:
-        return
-    st.markdown("---")
-    st.markdown("**📥 Downloads:**")
-    cols = st.columns(min(len(valid_files), 3))
-    for i, finfo in enumerate(valid_files):
-        with cols[i % len(cols)]:
-            with open(finfo["path"], "rb") as fp:
-                st.download_button(
-                    label=finfo.get("label", "Download"),
-                    data=fp.read(),
-                    file_name=finfo.get("filename", Path(finfo["path"]).name),
-                    mime=finfo.get("mime", "application/octet-stream"),
-                    use_container_width=True,
-                    key=f"{key_prefix}_{i}",
-                )
-
-
-# ------------------------------------------------------------------ #
-# Main area  —  Chat interface
-# ------------------------------------------------------------------ #
-
-st.markdown("# 🤖 JobAgent AI")
-st.caption(
-    "Search for jobs · Research companies · Tailor your resume · Draft cover letters & emails"
-)
-
-# Render conversation history
-for idx, msg in enumerate(st.session_state.messages):
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        # Render download buttons for this message if it has files
-        if msg.get("files"):
-            _render_download_buttons(msg["files"], key_prefix=f"hist_{idx}")
+            st.markdown(content)
 
 # Chat input
-if prompt := st.chat_input("Ask me anything about your job search…"):
-    # Append & display user message
+if prompt := st.chat_input("Ask me anything about jobs, companies, resumes...", disabled=st.session_state.processing):
+    # Display user message
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
+    with st.chat_message("user", avatar="👤"):
         st.markdown(prompt)
 
-    # Get agent response with a spinner
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking…"):
-            response = st.session_state.agent.chat(prompt)
-        st.markdown(response)
+    # Process with agent
+    with st.chat_message("assistant", avatar="🤖"):
+        with st.spinner("Thinking..."):
+            response, progress_output = run_agent_chat(prompt)
 
-        # Check for generated files from the agent
-        generated_files = list(st.session_state.agent.last_generated_files)
-        if generated_files:
-            _render_download_buttons(generated_files, key_prefix="new")
-            # Update the sidebar downloadable files registry
-            for finfo in generated_files:
-                st.session_state.downloadable_files[finfo["type"]] = finfo
+        # Show progress output if any (search status, etc.)
+        if progress_output.strip():
+            # Clean up progress lines — filter out debug logs, keep user-facing ones
+            progress_lines = []
+            skip_block = False
+            for line in progress_output.strip().split("\n"):
+                stripped = line.strip()
+                # Skip debug log blocks
+                if "🧭 DEBUG LOG" in stripped or "=" * 40 in stripped:
+                    skip_block = True
+                    continue
+                if skip_block:
+                    if stripped.startswith("="):
+                        skip_block = False
+                    continue
+                # Keep user-facing progress lines
+                if stripped and any(e in stripped for e in ("🔍", "📊", "💬", "✅", "❌", "🏢", "📄", "📧", "👤", "🔎")):
+                    progress_lines.append(stripped)
 
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": response,
-        "files": generated_files if generated_files else [],
-    })
+            if progress_lines:
+                progress_text = "\n".join(progress_lines)
+                st.caption(progress_text)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": progress_text,
+                    "type": "progress",
+                })
 
-    # Rerun to refresh the memory sidebar automatically
+        # Render the main response
+        if is_job_list_response(response):
+            # Interactive job selection with buttons
+            header, jobs = parse_job_list(response)
+
+            st.markdown("**Here are the jobs I found. Click one to select:**")
+
+            for i, job in enumerate(jobs, 1):
+                title = job.get("jobTitle") or job.get("title") or "Unknown"
+                company = job.get("companyName") or job.get("company") or "Unknown"
+                location = job.get("location") or "N/A"
+                url = job.get("applicationUrl") or job.get("url") or ""
+                salary = job.get("salary") or ""
+                experience = job.get("experienceLevel") or ""
+
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    label = f"**{i}. {title}** — {company}"
+                    if location != "N/A":
+                        label += f" 📍 {location}"
+                    if salary:
+                        label += f" 💰 {salary}"
+                    if experience:
+                        label += f" | {experience}"
+                    st.markdown(label)
+                    if url:
+                        st.caption(f"🔗 {url}")
+                with col2:
+                    if st.button(f"Select", key=f"job_{i}"):
+                        # Send the selection number to agent
+                        st.session_state.messages.append({"role": "user", "content": f"Selected job #{i}"})
+                        with st.spinner(f"Selecting job {i} and extracting JD..."):
+                            sel_response, sel_progress = run_agent_chat(str(i))
+                        st.session_state.messages.append({"role": "assistant", "content": sel_response})
+                        st.rerun()
+
+            # Also store the raw response for history
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response,
+                "type": "job_list",
+            })
+        else:
+            # Regular text response
+            st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
+
     st.rerun()
+
+
+# ------------------------------------------------------------------ #
+# Quick action buttons (shown when no conversation yet)
+# ------------------------------------------------------------------ #
+
+if not st.session_state.messages:
+    st.divider()
+    st.markdown("### 🚀 Quick Start")
+    cols = st.columns(4)
+    quick_actions = [
+        ("🔍 Search Jobs", "Find ML engineer jobs at Google"),
+        ("🏢 Research Company", "Research about OpenAI"),
+        ("📄 Tailor Resume", "Tailor my resume"),
+        ("✉️ Draft Email", "Draft an email"),
+    ]
+    for col, (label, prompt_text) in zip(cols, quick_actions):
+        with col:
+            if st.button(label, use_container_width=True):
+                st.session_state.messages.append({"role": "user", "content": prompt_text})
+                with st.spinner("Processing..."):
+                    response, _ = run_agent_chat(prompt_text)
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                st.rerun()
