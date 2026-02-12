@@ -16,7 +16,8 @@ except ModuleNotFoundError:
     InferenceClient = None
 
 import memory
-from linkup_client import LinkupJobSearch, normalize_search_results_to_jobs
+from linkup_client import LinkupJobSearch
+from company_research_agent import CompanyResearchAgent, JobPostingIntake
 from agents.resume_tailor_agent import TailorRequest, tailor_resume, _fetch_job_description_if_url
 from agents.role_search_agent import search_roles, RoleSearchQuery
 from job_searcher import JobSearcher
@@ -284,55 +285,16 @@ def execute_job_searcher(params: dict) -> str:
 
 
 def execute_company_profiler(params: dict) -> str:
-    """Execute company research — connects to your linkup_client.py"""
+    """Execute company research using CompanyResearchAgent for formatted markdown reports."""
     context = params.get("context") or {}
     selected_job = (context.get("selected_job") or {}) if isinstance(context, dict) else {}
-    job_intake_payload = (context.get("job_intake") or {}) if isinstance(context, dict) else {}
 
     company = (params.get("company") or "").strip() or (selected_job.get("company") or "").strip()
 
     warnings = []
     try:
         searcher = LinkupJobSearch()
-
-        if (
-            isinstance(job_intake_payload, dict)
-            and isinstance(selected_job, dict)
-            and selected_job.get("url")
-            and selected_job.get("url") != "NA"
-        ):
-            sources = job_intake_payload.get("sources")
-            has_url_source = isinstance(sources, list) and any(
-                isinstance(s, dict) and (s.get("url") or "").strip() == (selected_job.get("url") or "").strip()
-                for s in sources
-            )
-            if not has_url_source:
-                merged_sources = sources if isinstance(sources, list) else []
-                merged_sources.append(
-                    {
-                        "name": selected_job.get("title") or "Selected job posting",
-                        "url": selected_job.get("url"),
-                        "snippet": (selected_job.get("snippet") or "")[:300] or None,
-                        "favicon": None,
-                    }
-                )
-                job_intake_payload = {
-                    "answer": (job_intake_payload.get("answer") or "").strip(),
-                    "sources": merged_sources,
-                }
-
-        intake = None
-        if (
-            isinstance(job_intake_payload, dict)
-            and (job_intake_payload.get("answer") or "").strip()
-        ):
-            try:
-                intake = searcher.build_job_intake(job_intake_payload)
-                parsed_company = (getattr(intake, "company_name", "") or "").strip()
-                if parsed_company and parsed_company != "NA":
-                    company = parsed_company
-            except Exception:
-                intake = None
+        agent = CompanyResearchAgent(linkup_client=searcher.client)
 
         if not company or company == "NA":
             return json.dumps(
@@ -343,115 +305,51 @@ def execute_company_profiler(params: dict) -> str:
                 indent=2,
             )
 
-        # Debug trace: show which JD-aware inputs are available for profiling.
-        jd_answer = (
-            (job_intake_payload.get("answer") or "").strip()
-            if isinstance(job_intake_payload, dict)
-            else ""
-        )
-        jd_sources = (
-            job_intake_payload.get("sources")
-            if isinstance(job_intake_payload, dict)
-            else []
-        )
-        intake_debug = {}
-        if intake is not None:
-            intake_debug = {
-                "company_name": getattr(intake, "company_name", "NA"),
-                "role_title": getattr(intake, "role_title", "NA"),
-                "location": getattr(intake, "location", "NA"),
-                "workplace_type": getattr(intake, "workplace_type", "NA"),
-                "employment_type": getattr(intake, "employment_type", "NA"),
-                "job_url": getattr(intake, "job_url", "NA"),
-                "requirements_summary_len": len((getattr(intake, "requirements_summary", "") or "")),
-                "preferred_summary_len": len((getattr(intake, "preferred_summary", "") or "")),
-                "compensation_summary_len": len((getattr(intake, "compensation_summary", "") or "")),
-            }
-        elif jd_answer:
-            intake_debug = {"intake_parse_error": "intake parsing failed before research"}
+        print(f"\n🏢 Starting company research for: {company}")
 
-        print(f"\n{'=' * 80}")
-        print("🧭 DEBUG LOG: company_profiler JD context snapshot")
-        print(f"selected_job.company={selected_job.get('company') if isinstance(selected_job, dict) else 'NA'}")
-        print(f"selected_job.url={selected_job.get('url') if isinstance(selected_job, dict) else 'NA'}")
-        print(f"jd_payload_present={bool(jd_answer)}")
-        print(f"jd_answer_len={len(jd_answer)}")
-        print(f"jd_sources_count={len(jd_sources) if isinstance(jd_sources, list) else 0}")
-        print(f"jd_sources_urls={[((s.get('url') or '').strip()) for s in jd_sources if isinstance(s, dict)] if isinstance(jd_sources, list) else []}")
-        print(f"normalized_intake={json.dumps(intake_debug, indent=2)}")
-        print(f"{'=' * 80}\n")
+        # Extract role and job URL from selected job context if available
+        role = (selected_job.get("title") or selected_job.get("role") or "").strip() or None
+        job_url = (selected_job.get("url") or "").strip() or None
+        job_description = (selected_job.get("jd_text") or "").strip() or None
 
-        profile = None
-        sentiment = None
-
-        if (
-            isinstance(job_intake_payload, dict)
-            and (job_intake_payload.get("answer") or "").strip()
-            and intake is not None
-        ):
+        # Build job intake if we have JD text
+        job_intake = None
+        if job_description:
             try:
-                print(f"\n{'=' * 80}")
-                print("🧭 DEBUG LOG: company_profiler using JD-aware path")
-                print(f"job_intake_answer_len={len((job_intake_payload.get('answer') or '').strip())}")
-                print(f"job_intake_sources={job_intake_payload.get('sources') or []}")
-                print(f"{'=' * 80}\n")
-                combined = searcher.research_from_selected_jd(
-                    job_intake_payload,
-                    preferred_company=company,
-                )
-                if isinstance(combined, dict):
-                    profile = combined.get("profile")
-                    sentiment = combined.get("sentiment")
-                    combined_company = (combined.get("company") or "").strip()
-                    if combined_company and combined_company != "NA":
-                        company = combined_company
-            except Exception as e:
-                error_type = type(e).__name__
-                tb_text = traceback.format_exc().rstrip()
-                warning_message = (
-                    f"JD-aware profiling failed ({error_type}): {e}. "
-                    "Used fallback company/profile sentiment path."
-                )
-                warnings.append(warning_message)
-                print(f"\n{'=' * 80}")
-                print("⚠️ WARNING LOG: JD-aware company profiling path failed, using fallback path")
-                print(f"Type: {error_type}")
-                print(f"Message: {e}")
-                print("Traceback:")
-                print(tb_text)
-                print(f"{'=' * 80}\n")
-                profile = None
-                sentiment = None
-        elif isinstance(job_intake_payload, dict) and (job_intake_payload.get("answer") or "").strip() and intake is None:
-            warnings.append("JD intake parsing failed before JD-aware profiling; using fallback profile path.")
+                job_intake = JobPostingIntake.from_selected_jd_payload({
+                    "answer": job_description,
+                    "sources": [{"url": job_url, "name": selected_job.get("title", ""), "snippet": ""}] if job_url else [],
+                })
+            except Exception:
+                job_intake = None
 
-        if profile is None or sentiment is None:
-            print(f"\n{'=' * 80}")
-            print("🧭 DEBUG LOG: company_profiler using fallback non-JD path")
-            print(f"company={company}")
-            print(f"{'=' * 80}\n")
-            profile = searcher.get_company_profile(company, context=context if isinstance(context, dict) else None)
-            sentiment = searcher.get_company_sentiment(company, context=context if isinstance(context, dict) else None)
+        print("   📊 Fetching company profile & sentiment...")
+        combined = agent.research_company(
+            company=company,
+            role=role,
+            job_url=job_url,
+            job_description=job_description,
+            job_intake=job_intake,
+        )
+
+        profile = combined.get("profile", {})
+        sentiment = combined.get("sentiment", {})
+        final_company = (combined.get("company") or company).strip()
 
         payload = {
             "status": "success",
-            "company": company,
+            "company": final_company,
             "profile": _to_json_safe(profile),
             "sentiment": _to_json_safe(sentiment),
             "warnings": warnings,
-            "next_steps": "Want me to tailor your resume, draft a cover letter, or craft a recruiter message for the selected job?",
+            "next_steps": "Want me to tailor your resume, draft an email, or craft a recruiter message for the selected job?",
         }
+        print("   ✅ Company research complete!\n")
         return json.dumps(payload, indent=2)
     except Exception as e:
         error_type = type(e).__name__
         tb_text = traceback.format_exc().rstrip()
-        print(f"\n{'=' * 80}")
-        print("❌ ERROR LOG: company_profiler failed")
-        print(f"Type: {error_type}")
-        print(f"Message: {e}")
-        print("Traceback:")
-        print(tb_text)
-        print(f"{'=' * 80}\n")
+        print(f"\n❌ Company research failed: {e}\n")
         return json.dumps(
             {
                 "status": "error",
@@ -856,6 +754,9 @@ class JobAgent:
         self.awaiting_jd_text = False
         self.awaiting_email_jd_link = False
 
+        # Track files generated during the last chat() call for the UI to pick up.
+        self.last_generated_files: list[dict] = []
+
         # Best-effort: load resume text for downstream stubs/agents.
         self.context_store["user_resume"] = None
 
@@ -1008,8 +909,30 @@ class JobAgent:
                 "company profile",
                 "profile the company",
                 "tell me about the company",
+                "research about",
+                "tell me about",
+                "look up",
+                "what do you know about",
             )
         ) or ("research" in lowered and "company" in lowered)
+
+    def _extract_company_from_message(self, message: str) -> str:
+        """Try to extract a company name from a user message like 'research about Google'."""
+        lowered = (message or "").lower().strip()
+        # Patterns: 'research about X', 'tell me about X', 'look up X', 'research X'
+        for prefix in (
+            "research about", "tell me about", "look up",
+            "what do you know about", "profile", "research",
+        ):
+            if lowered.startswith(prefix):
+                candidate = message[len(prefix):].strip().rstrip(".!?")
+                # Remove trailing filler like "company", "the company"
+                for suffix in ("company", "the company", "the"):
+                    if candidate.lower().endswith(suffix):
+                        candidate = candidate[: -len(suffix)].strip()
+                if candidate:
+                    return candidate
+        return ""
 
     def _load_sample_jd_text(self) -> str | None:
         try:
@@ -1028,6 +951,14 @@ class JobAgent:
                     alias_value = normalized.get(alias)
                     if isinstance(alias_value, str) and alias_value.strip():
                         normalized["role"] = alias_value.strip()
+                        break
+        if tool_name == "company_profiler":
+            company_value = normalized.get("company")
+            if not (isinstance(company_value, str) and company_value.strip()):
+                for alias in ("query", "name", "company_name"):
+                    alias_value = normalized.get(alias)
+                    if isinstance(alias_value, str) and alias_value.strip():
+                        normalized["company"] = alias_value.strip()
                         break
         return normalized
 
@@ -1103,6 +1034,47 @@ class JobAgent:
 
         if tool_name == "company_profiler":
             msg = self._format_company_research_for_cli(tool_result)
+
+            # Generate a downloadable PDF from the research report
+            try:
+                from document.pdf_export import export_resume_to_pdf_ats
+                parsed_report = json.loads(tool_result)
+                company_name = (parsed_report.get("company") or "company").strip()
+                profile = parsed_report.get("profile") if isinstance(parsed_report.get("profile"), dict) else {}
+                sentiment = parsed_report.get("sentiment") if isinstance(parsed_report.get("sentiment"), dict) else {}
+                profile_md = (profile.get("report_markdown") or "").strip()
+                sentiment_md = (sentiment.get("report_markdown") or "").strip()
+                if not profile_md:
+                    profile_md = json.dumps(profile, indent=2) if profile else "No profile report."
+                if not sentiment_md:
+                    sentiment_md = json.dumps(sentiment, indent=2) if sentiment else "No sentiment report."
+
+                report_text = (
+                    f"Company Research Report: {company_name}\n\n"
+                    "COMPANY PROFILE\n"
+                    f"{profile_md}\n\n"
+                    "COMPANY SENTIMENT\n"
+                    f"{sentiment_md}"
+                )
+
+                out_dir = Path("outputs")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", company_name.lower())
+                pdf_path = str(out_dir / f"research_report_{safe_name}.pdf")
+                export_resume_to_pdf_ats(report_text, pdf_path, font_size=9)
+
+                if Path(pdf_path).exists():
+                    self.last_generated_files.append({
+                        "label": "📑 Company Research Report (PDF)",
+                        "path": str(Path(pdf_path).resolve()),
+                        "filename": Path(pdf_path).name,
+                        "type": "research_pdf",
+                        "mime": "application/pdf",
+                    })
+                    msg += "\n\n📥 You can download the full research report as a PDF below."
+            except Exception as pdf_err:
+                print(f"⚠️ Could not generate research report PDF: {pdf_err}")
+
             memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
             return msg
 
@@ -1227,17 +1199,35 @@ class JobAgent:
                 parsed = json.loads(tool_result)
                 if isinstance(parsed, dict) and parsed.get("status") in ("success", "ok"):
                     data = parsed.get("data", {})
-                    output_docx = data.get("output_docx_path") or parsed.get("output_docx_path", "N/A")
-                    output_pdf = data.get("output_pdf_path") or parsed.get("output_pdf_path", "N/A")
+                    output_docx = data.get("output_docx_path") or parsed.get("output_docx_path", "")
+                    output_pdf = data.get("output_pdf_path") or parsed.get("output_pdf_path", "")
+
+                    # Track generated files for the UI
+                    if output_docx and Path(output_docx).exists():
+                        self.last_generated_files.append({
+                            "label": "📄 Tailored Resume (DOCX)",
+                            "path": str(Path(output_docx).resolve()),
+                            "filename": Path(output_docx).name,
+                            "type": "resume_docx",
+                            "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        })
+                    if output_pdf and Path(output_pdf).exists():
+                        self.last_generated_files.append({
+                            "label": "📋 Tailored Resume (PDF)",
+                            "path": str(Path(output_pdf).resolve()),
+                            "filename": Path(output_pdf).name,
+                            "type": "resume_pdf",
+                            "mime": "application/pdf",
+                        })
+
                     message_parts = [
                         "✅ Resume tailored successfully!",
                         "",
-                        f"📄 Tailored Resume: {output_docx}",
-                        f"📋 ATS-Optimized PDF: {output_pdf}",
+                        "Your tailored resume is ready. You can download both the DOCX and ATS-optimized PDF versions below.",
                         "",
                         "Next steps:",
                         "1. Review the tailored resume",
-                        "2. Consider a cover letter (say: 'write a cover letter')",
+                        "2. Draft an email to the recruiter (say: 'draft an email')",
                         "3. Research the company (say: 'research the company')",
                     ]
                     msg = "\n".join(message_parts)
@@ -1276,6 +1266,7 @@ class JobAgent:
 
     def chat(self, user_message: str) -> str:
         """Process a user message and return agent response."""
+        self.last_generated_files = []
 
         user_message = (user_message or "").strip()
 
@@ -1421,7 +1412,7 @@ class JobAgent:
                     return msg
 
                 chosen = jobs[idx - 1]
-                chosen_jd = (chosen.get("jd_text") or "").strip() if isinstance(chosen, dict) else ""
+                chosen_jd = (chosen.get("jd_text") or chosen.get("jobDescriptionSummary") or "").strip() if isinstance(chosen, dict) else ""
                 print(f"\n{'=' * 80}")
                 print("🧭 DEBUG LOG: job selected by user")
                 print(f"user_selection_index={idx}")
@@ -1549,6 +1540,19 @@ class JobAgent:
         intake_payload = self.context_store.get("job_intake_payload") or {}
         has_selected_jd = isinstance(selected_job, dict) and bool((selected_job.get("jd_text") or "").strip())
         has_intake = isinstance(intake_payload, dict) and bool((intake_payload.get("answer") or "").strip())
+
+        # ---- Standalone company research (no job selected) ----
+        if self._is_company_research_request(user_message):
+            company_from_msg = self._extract_company_from_message(user_message)
+            company_from_ctx = (selected_job.get("company") or "").strip() if isinstance(selected_job, dict) else ""
+            company = company_from_msg or company_from_ctx
+            if company and company.lower() not in ("na", "n/a", ""):
+                return self._execute_tool_and_respond(
+                    tool_name="company_profiler",
+                    params={"company": company},
+                    reasoning=f"User requested company research for '{company}'.",
+                    user_message=user_message,
+                )
         
         # If user asks for email but no job selected, ask for link
         if has_email_request and not (has_selected_jd or has_intake):
@@ -1559,13 +1563,6 @@ class JobAgent:
         
         # ---- Optional deterministic router after job selection + JD intake ----
         if has_selected_jd or has_intake:
-            if self._is_company_research_request(user_message):
-                return self._execute_tool_and_respond(
-                    tool_name="company_profiler",
-                    params={},
-                    reasoning="User requested company research for the selected job.",
-                    user_message=user_message,
-                )
             if "tailor" in lowered and "resume" in lowered:
                 msg = (
                     "Resume tailoring is queued for the next phase. "
@@ -1775,10 +1772,10 @@ class JobAgent:
         return [m for m in self.conversation_history if m["role"] != "system"]
 
     def reset(self):
-        """Reset conversation."""
+        """Reset conversation and return confirmation message."""
         self.conversation_history = [self.conversation_history[0]]  # Keep system prompt
         self.context_store = {k: None for k in self.context_store}
-        print("🔄 Conversation reset.")
+        return "🔄 Conversation reset."
 
 
 # ------------------------------------------------------------------ #
@@ -1814,7 +1811,7 @@ def main():
             break
 
         if user_input.lower() == "reset":
-            agent.reset()
+            print(agent.reset())
             continue
 
         if user_input.lower() == "history":

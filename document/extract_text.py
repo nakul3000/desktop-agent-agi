@@ -29,6 +29,25 @@ def _extract_pdf_text(path: Path) -> Dict[str, Any]:
         from pdfminer.high_level import extract_text as pdf_extract_text
         text = pdf_extract_text(str(path)) or ""
         return _wrap_ok(text, source_type="pdf")
+    except ModuleNotFoundError as e:
+        # pdfminer.six provides the `pdfminer` module.
+        if getattr(e, "name", "") == "pdfminer":
+            return {
+                "status": "error",
+                "summary": (
+                    "Missing dependency 'pdfminer.six' required for PDF text extraction.\n"
+                    "\n"
+                    "Install it with one of:\n"
+                    "  - python -m pip install pdfminer.six\n"
+                    "  - conda install -c conda-forge pdfminer.six\n"
+                    "\n"
+                    "If pip fails with an SSL certificate error on macOS/Anaconda (e.g. OSStatus -26276), "
+                    "prefer the conda-forge install or update certs:\n"
+                    "  - conda update -n base -c conda-forge ca-certificates certifi openssl\n"
+                ),
+                "text": "",
+            }
+        return {"status": "error", "summary": f"PDF text extraction failed: {e}", "text": ""}
     except Exception as e:
         return {"status": "error", "summary": f"PDF text extraction failed: {e}", "text": ""}
 
@@ -40,6 +59,20 @@ def _extract_docx_text(path: Path) -> Dict[str, Any]:
         parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
         text = "\n".join(parts)
         return _wrap_ok(text, source_type="docx")
+    except ModuleNotFoundError as e:
+        if getattr(e, "name", "") in {"docx", "python_docx"}:
+            return {
+                "status": "error",
+                "summary": (
+                    "Missing dependency 'python-docx' required for DOCX text extraction.\n"
+                    "\n"
+                    "Install it with:\n"
+                    "  - python -m pip install python-docx\n"
+                    "  - conda install -c conda-forge python-docx\n"
+                ),
+                "text": "",
+            }
+        return {"status": "error", "summary": f"DOCX text extraction failed: {e}", "text": ""}
     except Exception as e:
         return {"status": "error", "summary": f"DOCX text extraction failed: {e}", "text": ""}
 

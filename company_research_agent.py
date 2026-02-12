@@ -20,8 +20,8 @@ class CompanyResearchDefaults:
     - We default to `deep` because company research is typically multi-tab work.
     """
 
-    depth_profile: str = "deep"
-    depth_sentiment: str = "deep"
+    depth_profile: str = "standard"
+    depth_sentiment: str = "standard"
     max_results: int = 8
 
     # If True, run fewer sub-queries (faster/cheaper, less coverage).
@@ -137,15 +137,6 @@ class JobPostingIntake:
             comp = _pick_non_na(llm_fields.get("compensation_summary"), comp)
             reqs = _pick_non_na(llm_fields.get("requirements_summary"), reqs)
             pref = _pick_non_na(llm_fields.get("preferred_summary"), pref)
-
-        print(f"\n{'=' * 80}")
-        print("🧭 DEBUG LOG: intake parsing mode")
-        print(f"mode={parse_mode}")
-        print(f"answer_len={len(answer) if answer != _NA else 0}")
-        print(f"company={company}")
-        print(f"role={role}")
-        print(f"location={location}")
-        print(f"{'=' * 80}\n")
 
         return JobPostingIntake(
             answer=answer,
@@ -635,17 +626,6 @@ class CompanyResearchAgent:
         if job_intake is not None:
             # Note: keep both the raw intake dict and the key fields at top-level for prompts.
             context.update(job_intake.to_context_dict())
-        print(f"\n{'=' * 80}")
-        print("🧭 DEBUG LOG: research_company context")
-        print(f"company={company}")
-        print(f"role={role or 'NA'}")
-        print(f"job_url={job_url or 'NA'}")
-        print(f"job_description_len={len((job_description or '').strip())}")
-        print(f"context_keys={sorted(list(context.keys()))}")
-        print(f"requirements_summary_len={len((str(context.get('requirements_summary') or '')).strip())}")
-        print(f"preferred_summary_len={len((str(context.get('preferred_summary') or '')).strip())}")
-        print(f"compensation_summary_len={len((str(context.get('compensation_summary') or '')).strip())}")
-        print(f"{'=' * 80}\n")
         profile = self.research_profile(company, context=context)
         sentiment = self.research_sentiment(company, context=context)
         return {
@@ -727,13 +707,6 @@ class CompanyResearchAgent:
         raw_responses: Dict[str, Any] = {}
 
         for name, prompt in named_prompts:
-            print(f"\n{'=' * 80}")
-            print("🧭 DEBUG LOG: company research query request")
-            print(f"query_name={name}")
-            print(f"depth={depth} output_type=sourcedAnswer max_results={max_results}")
-            print(f"prompt_len={len(prompt)}")
-            print(f"prompt:\n{prompt}")
-            print(f"{'=' * 80}\n")
             response = self._client.search(
                 query=prompt,
                 depth=depth,
@@ -747,22 +720,6 @@ class CompanyResearchAgent:
             answer = _safe_getattr(response, "answer", "") or ""
             sources_obj = _safe_getattr(response, "sources", []) or []
             sources = [_source_to_dict(s) for s in sources_obj]
-            print(f"\n{'=' * 80}")
-            print("🧭 DEBUG LOG: company research query response")
-            print(f"query_name={name}")
-            print(f"answer_len={len(answer)}")
-            print(
-                "answer_preview="
-                + (answer[:2800] + ("...[truncated]" if len(answer) > 2800 else ""))
-            )
-            print(f"source_count={len(sources)}")
-            for idx, src in enumerate(sources, start=1):
-                print(
-                    f"[source {idx}] name={(src.get('name') or '').strip() or 'NA'} | "
-                    f"url={(src.get('url') or '').strip() or 'NA'}"
-                )
-            print(f"{'=' * 80}\n")
-
             queries_run.append(
                 {
                     "name": name,
