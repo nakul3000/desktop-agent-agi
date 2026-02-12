@@ -528,8 +528,8 @@ Return all qualifying job links and details. Prioritize official {company_name} 
     ) -> dict:
         """
         JD extraction path for selected jobs.
-        This flow intentionally reuses already-extracted JD text from the
-        selected job payload and does not re-fetch the URL.
+        First tries to reuse already-extracted JD text from the payload.
+        If none exists, fetches the JD from the URL via Linkup search.
 
         Returns:
             {
@@ -575,16 +575,82 @@ Return all qualifying job links and details. Prioritize official {company_name} 
                 "source_name": "existing_jd_payload",
             }
 
-        return {
-            "status": "error",
-            "error": (
-                "Selected job did not include JD text in payload. "
-                "This path is configured to use payload JD only (no URL refetch)."
-            ),
-            "jd_text": "",
-            "source_url": canonical_target or url,
-            "source_name": "",
-        }
+        # --- Fallback: fetch the JD from the URL via Linkup search ---
+        print(f"\n{'=' * 80}")
+        print("🧭 DEBUG LOG: JD extraction — no payload text, fetching from URL")
+        print(f"job_url={url}")
+        print(f"{'=' * 80}\n")
+
+        role_hint = f" for the {role} role" if role else ""
+        company_hint = f" at {company}" if company else ""
+        query = (
+            f"Open this job posting and extract the full job description text "
+            f"including responsibilities, requirements, qualifications, and skills"
+            f"{role_hint}{company_hint}. URL: {url}"
+        )
+
+        try:
+            response = self.client.search(
+                query=query,
+                depth="deep",
+                output_type="searchResults",
+                include_images=False,
+            )
+
+            # Extract text from the Linkup response
+            if hasattr(response, "model_dump"):
+                response = response.model_dump()
+
+            fetched_text = ""
+            if isinstance(response, dict):
+                results = response.get("results") or response.get("data") or response.get("output") or []
+                if isinstance(results, list) and results:
+                    r0 = results[0]
+                    for key in ("content", "text", "snippet", "summary"):
+                        if isinstance(r0, dict) and r0.get(key):
+                            fetched_text = str(r0[key]).strip()
+                            break
+                if not fetched_text:
+                    fetched_text = str(response)[:8000].strip()
+            elif response:
+                fetched_text = str(response)[:8000].strip()
+
+            if fetched_text and len(fetched_text) > 50:
+                print(f"\n{'=' * 80}")
+                print("🧭 DEBUG LOG: JD extraction — URL fetch success")
+                print(f"fetched_jd_len={len(fetched_text)}")
+                print(f"fetched_jd_preview:\n{_preview_text(fetched_text, limit=1200)}")
+                print(f"{'=' * 80}\n")
+                return {
+                    "status": "success",
+                    "jd_text": fetched_text[:12000],
+                    "source_url": canonical_target or url,
+                    "source_name": "linkup_url_fetch",
+                }
+
+            print(f"\n{'=' * 80}")
+            print("🧭 DEBUG LOG: JD extraction — URL fetch returned insufficient text")
+            print(f"fetched_len={len(fetched_text)}")
+            print(f"{'=' * 80}\n")
+            return {
+                "status": "error",
+                "error": "Linkup URL fetch returned insufficient job description text.",
+                "jd_text": fetched_text,
+                "source_url": canonical_target or url,
+                "source_name": "",
+            }
+        except Exception as e:
+            print(f"\n{'=' * 80}")
+            print("🧭 DEBUG LOG: JD extraction — URL fetch exception")
+            print(f"error={type(e).__name__}: {e}")
+            print(f"{'=' * 80}\n")
+            return {
+                "status": "error",
+                "error": f"Linkup URL fetch failed: {type(e).__name__}: {e}",
+                "jd_text": "",
+                "source_url": canonical_target or url,
+                "source_name": "",
+            }
 
     def get_company_profile(self, company: str, query: str | None = None, *, context: Optional[Dict[str, Any]] = None) -> dict:
         """Research company background, funding, culture, tech stack."""
