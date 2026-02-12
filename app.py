@@ -18,6 +18,8 @@ except ModuleNotFoundError:
 import memory
 from linkup_client import LinkupJobSearch, normalize_search_results_to_jobs
 from agents.resume_tailor_agent import TailorRequest, tailor_resume, _fetch_job_description_if_url
+from agents.role_search_agent import search_roles, RoleSearchQuery
+from job_searcher import JobSearcher
 
 # from utils import load_resume_from_env
 
@@ -172,44 +174,79 @@ IMPORTANT RULES FOR TOOL CALLING:
 # ------------------------------------------------------------------ #
 
 def execute_job_searcher(params: dict) -> str:
-    """Execute job search — connects to your linkup_client.py"""
-    role = params.get("role", "Machine Learning Engineer")
+    """Execute job search using JobSearcher with structured output"""
+    
+    # Handle both structured params (role, company, location) and generic query
+    query_str = params.get("query", "")
+    role = params.get("role", "")
     company = params.get("company", "")
     location = params.get("location", "United States")
+    
+    # If we only have a generic query, parse it for role/company/location
+    if query_str and not role:
+        # Extract keywords from generic query
+        # e.g., "machine learning engineer jobs in google" -> role="machine learning engineer", company="google"
+        query_lower = query_str.lower()
+        
+        # Common company names
+        companies = ["google", "amazon", "microsoft", "meta", "apple", "netflix", "tesla", "stripe", "airbnb"]
+        
+        # Detect company
+        for comp in companies:
+            if comp in query_lower:
+                company = comp.capitalize()
+                role = query_str.replace(f"in {comp}", "").replace(f"at {comp}", "").replace("jobs", "").strip()
+                if not role:
+                    role = "Software Engineer"
+                break
+        
+        # If no company detected, use the query as role
+        if not role:
+            role = query_str if query_str else "Software Engineer"
+    
+    # Fallback
+    if not role:
+        role = "Machine Learning Engineer"
 
     try:
-        print(f"\n{'=' * 80}")
-        print("🧭 DEBUG LOG: execute_job_searcher input")
-        print(f"role={role!r} company={company!r} location={location!r}")
-        print(f"{'=' * 80}\n")
-        searcher = LinkupJobSearch()
-        response = searcher.search_jobs(role=role, company=company or None, location=location)
-        jobs = normalize_search_results_to_jobs(
-            response,
-            role=role,
-            company=company or None,
-            location=location,
-            limit=12,
-        )
-        results_count = len(getattr(response, "results", []) or [])
-        print(f"\n{'=' * 80}")
-        print("🧭 DEBUG LOG: execute_job_searcher output")
-        print(f"search_results_count={results_count} normalized_jobs_count={len(jobs)}")
-        for idx, j in enumerate(jobs, start=1):
-            jd_text = (j.get("jd_text") or "").strip()
-            print(
-                f"[job {idx}] title={j.get('title')} | company={j.get('company')} | location={j.get('location')} | "
-                f"url={j.get('url')} | jd_len={len(jd_text)}"
-            )
-        print(f"{'=' * 80}\n")
+        # Use JobSearcher with Linkup structured output
+        searcher = JobSearcher()
+        result_json = searcher.execute_search({
+            "role": role,
+            "company": company,
+            "location": location,
+        })
+        
+        # Parse the result
+        result = json.loads(result_json) if isinstance(result_json, str) else result_json
+        
+        # Extract jobs from response
+        jobs_list = []
+        if result.get("status") == "success":
+            response = result.get("response", {})
+            
+            # Handle structured output - response contains the schema output
+            if hasattr(response, "model_dump"):
+                response = response.model_dump()
+            
+            # Structured output returns jobs directly
+            if isinstance(response, dict):
+                jobs_list = response.get("jobs", [])
+            elif isinstance(response, str):
+                try:
+                    response_data = json.loads(response)
+                    jobs_list = response_data.get("jobs", [])
+                except:
+                    jobs_list = []
+        
         return json.dumps(
             {
                 "status": "success",
                 "query": {"role": role, "company": company, "location": location},
-                "search_results_count": results_count,
-                "jobs_found": len(jobs),
-                "jobs": jobs,
-                "next_steps": "Reply with the number of a job to select it. If the JD text wasn't captured, you'll be prompted to paste it.",
+                "search_results_count": len(jobs_list),
+                "jobs_found": len(jobs_list),
+                "jobs": jobs_list,
+                "next_steps": "Reply with the number of a job to select it." if jobs_list else "No jobs found. Try a different search query.",
             },
             indent=2,
         )
@@ -654,11 +691,27 @@ class JobAgent:
     def _format_job_list_for_cli(self, jobs: list[dict]) -> str:
         lines = []
         for i, j in enumerate(jobs, start=1):
-            title = (j.get("title") or "NA").strip()
-            company = (j.get("company") or "NA").strip()
-            location = (j.get("location") or "NA").strip()
-            url = (j.get("url") or "NA").strip()
-            lines.append(f"{i}. {title} — {company} ({location})\n   {url}")
+            # Handle both field name formats (jobTitle vs title, companyName vs company, etc.)
+            title = (j.get("jobTitle") or j.get("title") or "N/A").strip()
+            company = (j.get("companyName") or j.get("company") or "N/A").strip()
+            location = (j.get("location") or "N/A").strip()
+            experience = (j.get("experienceLevel") or "").strip()
+            salary = (j.get("salaryRange") or "").strip()
+            url = (j.get("applicationUrl") or j.get("url") or "").strip()
+            
+            # Build info line
+            info = f"{i}. {title} — {company}"
+            if location and location != "N/A":
+                info += f" ({location})"
+            if experience:
+                info += f" [{experience}]"
+            if salary:
+                info += f" ${salary}"
+            
+            lines.append(info)
+            if url:
+                lines.append(f"   {url}")
+        
         return "\n".join(lines)
 
     def _next_action_prompt(self) -> str:
