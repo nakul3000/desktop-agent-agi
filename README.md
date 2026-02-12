@@ -1,78 +1,124 @@
 # desktop-agent-agi
 
-A repo for hack with DC desktop personal agent.
-This project builds a local-first desktop agent that can search, summarize, and orchestrate tools while keeping a privacy-friendly memory (SQLite) of conversations, artifacts, and facts for better follow-ups.
+A local-first desktop agent that can search, summarize, and orchestrate tools -- built for the Hack with DC hackathon. It keeps a privacy-friendly memory (SQLite) of conversations, artifacts, and facts for better follow-ups.
 
-## Setup
+---
 
-Install dependencies (use the same Python you run the app with):
+## Getting Started
+
+Follow these steps to get the app running on your computer.
+
+### 1. Clone the repo
+
+Open a terminal and run:
+
+```bash
+git clone https://github.com/your-username/desktop-agent-agi.git
+cd desktop-agent-agi
+```
+
+### 2. Create a virtual environment
+
+This keeps your dependencies isolated so nothing breaks on your system.
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+On Windows use:
+
+```bash
+python -m venv venv
+venv\Scripts\activate
+```
+
+### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-If your default `pip` is broken (e.g. SyntaxError inside pip’s truststore), use a specific Python or a venv:
+### 4. Set up environment variables
+
+The app needs two API keys to work. Create a `.env` file in the project folder:
 
 ```bash
-# Option A: Use Python 3.11 explicitly (if installed)
-python3.11 -m pip install -r requirements.txt
-python3.11 -m pytest tests/test_email_handler.py -v
-
-# Option B: Create a venv with a working Python, then install
-python3.11 -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-pytest tests/test_email_handler.py -v
+cp .env.example .env
 ```
 
-Required env (see `.env.example`): `LINKUP_API_KEY`, `HF_TOKEN`. Optional: Gmail credentials for email features.
+Then open `.env` and fill in your keys:
 
-## Packaging notes
-- This repo currently ships without a `pyproject.toml` or `setup.py`. Use `requirements.txt` for dependencies or add your own packaging config if you need installs.
+```
+LINKUP_API_KEY=your-linkup-api-key-here
+HF_TOKEN=your-huggingface-token-here
+```
 
-## Memory component
+- **LINKUP_API_KEY** -- get one from [Linkup](https://www.linkup.so/)
+- **HF_TOKEN** -- get one from [Hugging Face](https://huggingface.co/settings/tokens)
 
-### Explanation - What it does
-- Captures the conversation: every user, assistant, and tool turn is saved with timestamps (so we can replay context later).
-- Keeps artifacts: anything the agent produces or ingests (summaries, search results, drafts, research) is stored with who/what created it.
-- Stores facts: structured nuggets like deadlines, meetings, tasks, preferences—tagged with confidence and linked back to the artifact that revealed them.
-- Tracks references: when someone says “that deadline” or “the doc,” we remember what it pointed to for deterministic follow-ups.
-- Recency + structured recall: everything works via stored turns, artifacts, facts, and references.
-- User + session awareness: rows are scoped by session (and optionally user_id), so different users or runs don’t collide.
-- One-time init: `memory.init_db()` creates the SQLite schema; data lives on disk across runs (we ignore `memory.db` in git).
+You can also add your resume path so the agent knows where to find it:
 
-### Files and database
-- Files: `memory.py`, `tests/test_memory_stub.py`.
-- Database: SQLite (`memory.db` by default). Call `init_db()` to create tables for turns, artifacts, facts, and references.
-- Persistence helpers: `store_turn`, `store_artifact`, `store_fact` write rows with ISO timestamps; they raise `RuntimeError` if a DB write fails.
-- Tests: `tests/test_memory_stub.py` includes smoke tests for inserts/retrieval and asserts that insert helpers surface errors.
-- Data model (all scoped by `session_id`):
-  - `turns`: every user/assistant/tool message with timestamp.
-  - `artifacts`: generated or extracted items (doc summaries, drafts, research outputs) with optional source turn and creator tag.
-  - `facts`: structured nuggets like deadlines/meetings/tasks with confidence and meta JSON (e.g., title, source artifact).
-  - `references`: records how vague phrases (“that”, “the deadline”) were resolved for deterministic follow-ups.
-- Usage quickstart:
-  1) `memory.init_db()` (once).
-  2) `turn_id = memory.store_turn(session, "user", "Hi")`
-  3) `artifact_id = memory.store_artifact(session, "doc_summary", {"title": "...", "content": "..."})`
-  4) `fact_id = memory.store_fact(session, "deadline", "response_deadline", "2026-02-15", meta={"title": "Respond to ..."})`
+```
+RESUME_PATH=/absolute/path/to/your/resume.pdf
+```
 
-## Email handler
+### 5. Add your resume (optional)
 
-### Explanation - What it does
-- **Recruiter lookup**: Finds recruiter contact details (name, title, email, LinkedIn) for a given company and role using the Linkup API. Uses a structured schema to request multiple contacts per query, scrapes emails and LinkedIn URLs from responses, and deduplicates by name.
-- **Quality filters**: Rejects placeholder emails (e.g. `z@company.com`, `first.last@company.com`, `f.last@`), reply relays and marketing domains (e.g. `reply-xxx@reply.s12.y.mc.salesf`), and free-provider addresses when a corporate domain is expected. Prefers same-company contacts over agency/third-party when sorting.
-- **Outreach package**: End-to-end flow for job outreach: parse job description and resume, find recruiter contacts via Linkup, draft a personalized outreach email (subject + body). Used by `AgentCore` for the `job_outreach` intent.
-- **Gmail integration**: Optional. Read and parse emails, summarize threads, extract deadlines/tasks/entities, draft replies. Requires Google OAuth (`credentials.json` + `token.json`).
+If you want to tailor your own resume, drop your resume file into the `outputs/` folder using these exact names:
 
-### Files and usage
-- **File**: `email_handler.py` — `EmailHandler` class.
-- **Recruiter lookup**: `find_recruiter_contact(company=..., role_title=..., team_or_domain=..., min_emails=3)` returns `{ "name", "title", "email", "emails", "linkedin_urls", "contacts", "confidence", "fallback_suggestion" }`. Requires `LINKUP_API_KEY`.
-- **Outreach package**: `build_recruiter_outreach_package(role_title=..., job_description=..., resume_text=..., company=..., ...)` returns recruiter info + `email_subject`, `email_body`, and `analysis` (parsed JD and resume). Uses LLM for JD/resume parsing and draft (optional `HF_TOKEN`).
-- **Run examples**: `python run_recruiter_examples.py` (or pass company and role as CLI args). Unit and integration tests: `pytest tests/test_email_handler.py -v`.
-<<<<<<< HEAD
-- **Integration**: `AgentCore.handle_message({"intent": "job_outreach", "role_title": ..., "job_description": ..., "resume_text": ..., "company": ...})` calls `build_recruiter_outreach_package` and returns the payload.
- 
-=======
-- **Integration**: `AgentCore.handle_message({"intent": "job_outreach", "role_title": ..., "job_description": ..., "resume_text": ..., "company": ...})` calls `build_recruiter_outreach_package` and returns the payload.
+```
+outputs/tailored_resume.docx
+outputs/tailored_resume_ats.pdf
+```
 
+Put both a `.docx` and a `.pdf` version with the same naming. The Resume Tailor Agent will read from here and write the tailored version back to the same spot.
+
+### 6. Run the app
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The app will open in your browser automatically (usually at `http://localhost:8501`). That's it!
+
+---
+
+## Project Overview
+
+### Memory
+
+- Every conversation turn, artifact, and fact is saved to a local SQLite database (`memory.db`).
+- Data is scoped by session so different runs don't collide.
+- Call `memory.init_db()` once to create the tables. The Streamlit app does this for you.
+
+### Agents
+
+The app is powered by three specialized agents that work together:
+
+- **Role Search Agent** -- Searches for open job postings across the web using Linkup. You give it job titles, location, and keywords and it returns a deduplicated list of matching roles with company, URL, and requirements.
+
+- **Job Description Agent** -- Takes a selected job posting and fetches the full, clean job description text (responsibilities, requirements, skills). It can pull directly from a URL or search for the listing. Returns up to 3 variants so you can pick the best one.
+
+- **Resume Tailor Agent** -- The core of the app. Give it your resume (PDF) and a job description (text or URL) and it will tailor your resume to match the role. It extracts keywords from the JD, rewrites your bullet points to highlight relevant experience, and exports the result as both DOCX and ATS-friendly PDF.
+
+### Email / Recruiter Outreach
+
+- Finds recruiter contacts (name, email, LinkedIn) for a company and role using Linkup.
+- Filters out junk emails and prefers same-company contacts.
+- Can draft personalized outreach emails using an LLM.
+- Optional Gmail integration for reading/summarizing threads (requires Google OAuth credentials).
+
+### Key Files
+
+| File | What it does |
+|---|---|
+| `streamlit_app.py` | Chat UI (Streamlit) |
+| `app.py` | Core agent logic |
+| `agents/role_search_agent.py` | Searches for open job postings |
+| `agents/job_description_agent.py` | Fetches and cleans job descriptions |
+| `agents/resume_tailor_agent.py` | Tailors your resume to a job description |
+| `memory.py` | SQLite memory layer |
+| `linkup_client.py` | Linkup API wrapper |
+| `email_handler.py` | Recruiter lookup + email drafting |
+| `requirements.txt` | Python dependencies |

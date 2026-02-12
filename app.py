@@ -638,6 +638,9 @@ class JobAgent:
         self.awaiting_jd_text = False
         self.awaiting_email_jd_link = False
 
+        # Track files generated during the last chat() call for the UI to pick up.
+        self.last_generated_files: list[dict] = []
+
         # Best-effort: load resume text for downstream stubs/agents.
         self.context_store["user_resume"] = None
 
@@ -915,6 +918,47 @@ class JobAgent:
 
         if tool_name == "company_profiler":
             msg = self._format_company_research_for_cli(tool_result)
+
+            # Generate a downloadable PDF from the research report
+            try:
+                from document.pdf_export import export_resume_to_pdf_ats
+                parsed_report = json.loads(tool_result)
+                company_name = (parsed_report.get("company") or "company").strip()
+                profile = parsed_report.get("profile") if isinstance(parsed_report.get("profile"), dict) else {}
+                sentiment = parsed_report.get("sentiment") if isinstance(parsed_report.get("sentiment"), dict) else {}
+                profile_md = (profile.get("report_markdown") or "").strip()
+                sentiment_md = (sentiment.get("report_markdown") or "").strip()
+                if not profile_md:
+                    profile_md = json.dumps(profile, indent=2) if profile else "No profile report."
+                if not sentiment_md:
+                    sentiment_md = json.dumps(sentiment, indent=2) if sentiment else "No sentiment report."
+
+                report_text = (
+                    f"Company Research Report: {company_name}\n\n"
+                    "COMPANY PROFILE\n"
+                    f"{profile_md}\n\n"
+                    "COMPANY SENTIMENT\n"
+                    f"{sentiment_md}"
+                )
+
+                out_dir = Path("outputs")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", company_name.lower())
+                pdf_path = str(out_dir / f"research_report_{safe_name}.pdf")
+                export_resume_to_pdf_ats(report_text, pdf_path, font_size=9)
+
+                if Path(pdf_path).exists():
+                    self.last_generated_files.append({
+                        "label": "📑 Company Research Report (PDF)",
+                        "path": str(Path(pdf_path).resolve()),
+                        "filename": Path(pdf_path).name,
+                        "type": "research_pdf",
+                        "mime": "application/pdf",
+                    })
+                    msg += "\n\n📥 You can download the full research report as a PDF below."
+            except Exception as pdf_err:
+                print(f"⚠️ Could not generate research report PDF: {pdf_err}")
+
             memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
             return msg
 
@@ -959,13 +1003,31 @@ class JobAgent:
                 parsed = json.loads(tool_result)
                 if isinstance(parsed, dict) and parsed.get("status") in ("success", "ok"):
                     data = parsed.get("data", {})
-                    output_docx = data.get("output_docx_path") or parsed.get("output_docx_path", "N/A")
-                    output_pdf = data.get("output_pdf_path") or parsed.get("output_pdf_path", "N/A")
+                    output_docx = data.get("output_docx_path") or parsed.get("output_docx_path", "")
+                    output_pdf = data.get("output_pdf_path") or parsed.get("output_pdf_path", "")
+
+                    # Track generated files for the UI
+                    if output_docx and Path(output_docx).exists():
+                        self.last_generated_files.append({
+                            "label": "📄 Tailored Resume (DOCX)",
+                            "path": str(Path(output_docx).resolve()),
+                            "filename": Path(output_docx).name,
+                            "type": "resume_docx",
+                            "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        })
+                    if output_pdf and Path(output_pdf).exists():
+                        self.last_generated_files.append({
+                            "label": "📋 Tailored Resume (PDF)",
+                            "path": str(Path(output_pdf).resolve()),
+                            "filename": Path(output_pdf).name,
+                            "type": "resume_pdf",
+                            "mime": "application/pdf",
+                        })
+
                     message_parts = [
                         "✅ Resume tailored successfully!",
                         "",
-                        f"📄 Tailored Resume: {output_docx}",
-                        f"📋 ATS-Optimized PDF: {output_pdf}",
+                        "Your tailored resume is ready. You can download both the DOCX and ATS-optimized PDF versions below.",
                         "",
                         "Next steps:",
                         "1. Review the tailored resume",
@@ -1008,6 +1070,7 @@ class JobAgent:
 
     def chat(self, user_message: str) -> str:
         """Process a user message and return agent response."""
+        self.last_generated_files = []
 
         user_message = (user_message or "").strip()
 
@@ -1153,7 +1216,7 @@ class JobAgent:
                     return msg
 
                 chosen = jobs[idx - 1]
-                chosen_jd = (chosen.get("jd_text") or "").strip() if isinstance(chosen, dict) else ""
+                chosen_jd = (chosen.get("jd_text") or chosen.get("jobDescriptionSummary") or "").strip() if isinstance(chosen, dict) else ""
                 print(f"\n{'=' * 80}")
                 print("🧭 DEBUG LOG: job selected by user")
                 print(f"user_selection_index={idx}")
@@ -1490,10 +1553,10 @@ class JobAgent:
         return [m for m in self.conversation_history if m["role"] != "system"]
 
     def reset(self):
-        """Reset conversation."""
+        """Reset conversation and return confirmation message."""
         self.conversation_history = [self.conversation_history[0]]  # Keep system prompt
         self.context_store = {k: None for k in self.context_store}
-        print("🔄 Conversation reset.")
+        return "🔄 Conversation reset."
 
 
 # ------------------------------------------------------------------ #
@@ -1529,7 +1592,7 @@ def main():
             break
 
         if user_input.lower() == "reset":
-            agent.reset()
+            print(agent.reset())
             continue
 
         if user_input.lower() == "history":
