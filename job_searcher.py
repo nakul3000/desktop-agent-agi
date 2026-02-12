@@ -109,11 +109,7 @@ CRITICAL RULES:
                 include_sources=False,
             )
             
-            print(f"\n✅ Search completed for: {role}")
-            if company:
-                print(f"   Company: {company}")
-            print(f"   Location: {location}\n")
-            print(response)
+            # Don't print raw response - let agent format it for display
             
             # Return structured response
             return json.dumps({
