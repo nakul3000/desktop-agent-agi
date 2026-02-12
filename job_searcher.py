@@ -4,7 +4,10 @@
 import json
 import os
 from dotenv import load_dotenv
-from linkup import LinkupClient
+try:
+    from linkup_sdk import LinkupClient
+except ImportError:
+    from linkup import LinkupClient
 
 load_dotenv()
 
