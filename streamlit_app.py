@@ -17,7 +17,7 @@ from app import JobAgent
 # ------------------------------------------------------------------ #
 
 st.set_page_config(
-    page_title="JobAgent AI",
+    page_title="Pathfind AI",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -135,7 +135,7 @@ if "downloadable_files" not in st.session_state:
 # ------------------------------------------------------------------ #
 
 with st.sidebar:
-    st.markdown("## 🤖 JobAgent AI")
+    st.markdown("## 🤖 Pathfind AI")
     st.caption("Intelligent Job Search Assistant")
 
     st.divider()
@@ -313,7 +313,7 @@ def _render_download_buttons(files: list[dict], key_prefix: str = "dl"):
 # Main area  —  Chat interface
 # ------------------------------------------------------------------ #
 
-st.markdown("# 🤖 JobAgent AI")
+st.markdown("# 🤖 Pathfind AI")
 st.caption(
     "Search for jobs · Research companies · Tailor your resume · Draft cover letters & emails"
 )
