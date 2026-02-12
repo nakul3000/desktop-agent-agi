@@ -14,6 +14,9 @@ huggingface_hub
 # Linkup (correct SDK)
 linkup-sdk
 
+# PDF handling
+pdfminer.six
+
 # PDF export (ATS resume)
 reportlab
 

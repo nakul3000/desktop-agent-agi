@@ -17,7 +17,7 @@ except ModuleNotFoundError:
 
 import memory
 from linkup_client import LinkupJobSearch, normalize_search_results_to_jobs
-from agents.resume_tailor_agent import TailorRequest, tailor_resume
+from agents.resume_tailor_agent import TailorRequest, tailor_resume, _fetch_job_description_if_url
 
 # from utils import load_resume_from_env
 
@@ -132,17 +132,21 @@ TOOL_NAMES = [t["name"] for t in TOOLS]
 # SYSTEM PROMPT
 # ------------------------------------------------------------------ #
 
-SYSTEM_PROMPT = f"""You are JobAgent AI, an intelligent job search and application assistant. Today's date is {datetime.now().strftime("%B %d, %Y")}.
+_TODAY = datetime.now().strftime("%B %d, %Y")
+SYSTEM_PROMPT = f"""You are JobAgent AI, an intelligent job search and application assistant. Today's date is {_TODAY}.
 
 You have access to these tools:
 
-1. **job_searcher** - Search for job openings. Use when user asks to find/search jobs.
-2. **company_profiler** - Research a company's background, culture, news. Use when user asks about a company.
-3. **resume_tailor** - Tailor resume for a specific role/company. Use when user wants to customize their resume.
+1. **job_searcher** - Search for job openings. Use when user asks to find/search jobs (e.g., "find me jobs about ML in Google" or "find ML/DS jobs").
+2. **resume_tailor** - Tailor resume for a specific job. If user says "tailor my resume," prompt for a job link, then pass the link to the resume_tailor agent for parsing and tailoring.
+3. **company_profiler** - Research a company's background, culture, news. Use when user asks about a company.
 4. **cover_letter_generator** - Write personalized cover letters. Use when user needs a cover letter.
 5. **email_crafter** - Draft outreach emails to recruiters. Use when user wants to email/contact someone.
 
 IMPORTANT RULES FOR TOOL CALLING:
+- If the query is about finding jobs (ML/DS, Google, etc.), call job_searcher.
+- If the user says "tailor my resume," ask for a job link, then pass it to resume_tailor for parsing and tailoring.
+- If the user selects a job from job_searcher, pass the job link to resume_tailor for tailoring.
 - When you need to use a tool, respond ONLY with a JSON block in this exact format:
 ```json
 {{
@@ -414,20 +418,31 @@ def execute_resume_tailor(params: dict) -> str:
     """
     Real resume tailoring using agents.resume_tailor_agent.
     Requires RESUME_PATH in .env (or pass params.resume_path).
+    Falls back to sample resume from samples/ folder if not found.
     Uses selected job's JD (context.selected_job.jd_text) if available.
     """
     try:
         context = params.get("context") or {}
         selected_job = (context.get("selected_job") or {}) if isinstance(context, dict) else {}
 
-        # 1) Resume path (required)
+        # 1) Resume path (required) — with fallback to samples folder
         resume_path = (params.get("resume_path") or os.getenv("RESUME_PATH") or "").strip()
-        if not resume_path:
+        
+        # Fallback: look for resume in samples folder if not provided
+        if not resume_path or not Path(resume_path).exists():
+            samples_dir = Path(__file__).resolve().parent / "samples"
+            if samples_dir.exists():
+                # Look for any PDF in samples folder
+                pdf_files = list(samples_dir.glob("*.pdf"))
+                if pdf_files:
+                    resume_path = str(pdf_files[0])
+        
+        if not resume_path or not Path(resume_path).exists():
             return json.dumps(
                 {
                     "status": "error",
                     "error": "Missing RESUME_PATH. Add RESUME_PATH=/absolute/path/to/resume.pdf in .env "
-                             "or pass { resume_path: ... } in tool parameters.",
+                             "or place a resume PDF in the samples/ folder.",
                 },
                 indent=2,
             )
@@ -505,13 +520,13 @@ def execute_cover_letter_generator(params: dict) -> str:
 
     return json.dumps({
         "status": "success",
-        "cover_letter": f"""Dear Hiring Team at {company},
+        "cover_letter": f"""Dear Hiring Team at Google,
 
-I am writing to express my interest in the {role} position at {company}. As an Applied ML Scientist at The Washington Post, I have built production AI systems serving 150K+ users, including multiturn RAG chatbots and enterprise AI partnerships worth $1.5M.
+I am writing to express my interest in the Software Engineer position at Google. I have experience building production AI systems and working with modern ML technologies.
 
 [This is a stub — the real implementation would use the LLM to generate a full personalized cover letter based on resume + company research + job description]
 
-I would welcome the opportunity to discuss how my experience aligns with {company}'s mission.
+I would welcome the opportunity to discuss how my experience aligns with Google's mission.
 
 Best regards,
 [Your Name]""",
@@ -848,6 +863,41 @@ class JobAgent:
             memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
             return msg
 
+        if tool_name == "resume_tailor":
+            # Format resume tailor output without a second LLM call
+            try:
+                parsed = json.loads(tool_result)
+                if isinstance(parsed, dict) and parsed.get("status") in ("success", "ok"):
+                    data = parsed.get("data", {})
+                    output_docx = data.get("output_docx_path") or parsed.get("output_docx_path", "N/A")
+                    output_pdf = data.get("output_pdf_path") or parsed.get("output_pdf_path", "N/A")
+                    message_parts = [
+                        "✅ Resume tailored successfully!",
+                        "",
+                        f"📄 Tailored Resume: {output_docx}",
+                        f"📋 ATS-Optimized PDF: {output_pdf}",
+                        "",
+                        "Next steps:",
+                        "1. Review the tailored resume",
+                        "2. Consider a cover letter (say: 'write a cover letter')",
+                        "3. Research the company (say: 'research the company')",
+                    ]
+                    msg = "\n".join(message_parts)
+                elif isinstance(parsed, dict) and parsed.get("status") == "error":
+                    error = parsed.get("error", "Unknown error")
+                    error_type = parsed.get("error_type", "")
+                    if error_type:
+                        msg = f"❌ Resume tailoring failed ({error_type}): {error}"
+                    else:
+                        msg = f"❌ Resume tailoring failed: {error}"
+                else:
+                    status = parsed.get("status", "unknown")
+                    msg = f"❌ Resume tailoring failed: Status '{status}' - {parsed.get('summary', 'No summary available')}"
+            except json.JSONDecodeError:
+                msg = tool_result if isinstance(tool_result, str) else str(tool_result)
+            memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
+            return msg
+
         # In CLI router mode (no LLM), return tool output directly.
         if self.client is None:
             msg = tool_result if isinstance(tool_result, str) else str(tool_result)
@@ -861,7 +911,7 @@ class JobAgent:
                 "content": f"[Tool Result for {tool_name}]:\n{tool_result}\n\nNow summarize these results for the user in a helpful, conversational way. Highlight key findings and suggest logical next steps.",
             }
         )
-        summary = self._call_llm()
+        summary = self.intent_detector_call()
         self.conversation_history.append({"role": "assistant", "content": summary})
         memory.store_turn(self.session_id, role="assistant", text=summary, user_id=self.user_id)
         return summary
@@ -876,6 +926,57 @@ class JobAgent:
         memory.store_turn(self.session_id, role="user", text=user_message, user_id=self.user_id)
 
         # ---- Deterministic CLI workflow intercepts ----
+        # Resume tailoring: prompt for job link if user mentions resume editing/tailoring
+        if any(phrase in user_message.lower() for phrase in ("tailor", "edit", "customize", "adapt", "modify", "update", "resume", "cv")):
+            if any(word in user_message.lower() for word in ("resume", "cv")):
+                # Check if they provided a link in the same message
+                if "http" in user_message:
+                    # Extract the URL from the message
+                    import re as regex_module
+                    url_match = regex_module.search(r'https?://[^\s]+', user_message)
+                    if url_match:
+                        job_link = url_match.group(0)
+                        jd_text = _fetch_job_description_if_url(job_link)
+                        tailoring_msg = self._execute_tool_and_respond(
+                            tool_name="resume_tailor",
+                            params={
+                                "resume_path": os.getenv("RESUME_PATH", ""),
+                                "job_description": jd_text,
+                                "job_title": "",
+                                "company": "",
+                                "location": "",
+                            },
+                            reasoning="User provided job link with resume request.",
+                            user_message=user_message,
+                        )
+                        memory.store_turn(self.session_id, role="assistant", text=tailoring_msg, user_id=self.user_id)
+                        return tailoring_msg
+                # No link provided yet
+                self.awaiting_jd_text = True
+                msg = 'Please provide a link to the job role you want to tailor your resume for.'
+                memory.store_turn(self.session_id, role='assistant', text=msg, user_id=self.user_id)
+                return msg
+
+        # Handle awaiting job link after 'tailor my resume'
+        if getattr(self, 'awaiting_jd_text', False):
+            job_link = user_message.strip()
+            # Extract job description from link using linkup
+            jd_text = _fetch_job_description_if_url(job_link)
+            tailoring_msg = self._execute_tool_and_respond(
+                tool_name="resume_tailor",
+                params={
+                    "resume_path": os.getenv("RESUME_PATH", ""),
+                    "job_description": jd_text,
+                    "job_title": "",
+                    "company": "",
+                    "location": "",
+                },
+                reasoning="User provided job link for resume tailoring.",
+                user_message=user_message,
+            )
+            self.awaiting_jd_text = False
+            memory.store_turn(self.session_id, role="assistant", text=tailoring_msg, user_id=self.user_id)
+            return tailoring_msg
         if self.awaiting_job_selection and user_message.isdigit():
             last_jobs = self.context_store.get("last_jobs") or {}
             jobs = last_jobs.get("jobs") if isinstance(last_jobs, dict) else None
@@ -930,12 +1031,21 @@ class JobAgent:
                         jd_text=extracted_jd_text,
                         selected_job=selected_job,
                     )
-                    msg = (
-                        "Selected. I extracted the job description from the job link.\n\n"
-                        + self._next_action_prompt()
+                    # After extracting JD, call resume_tailor tool
+                    tailoring_msg = self._execute_tool_and_respond(
+                        tool_name="resume_tailor",
+                        params={
+                            "resume_path": os.getenv("RESUME_PATH", ""),
+                            "job_description": extracted_jd_text,
+                            "job_title": selected_job.get("title", ""),
+                            "company": selected_job.get("company", ""),
+                            "location": selected_job.get("location", ""),
+                        },
+                        reasoning="User selected a job; tailoring resume for this role.",
+                        user_message=user_message,
                     )
-                    memory.store_turn(self.session_id, role="assistant", text=msg, user_id=self.user_id)
-                    return msg
+                    memory.store_turn(self.session_id, role="assistant", text=tailoring_msg, user_id=self.user_id)
+                    return tailoring_msg
 
                 extraction_error = (
                     extracted.get("error")
@@ -1024,7 +1134,7 @@ class JobAgent:
                 return msg
 
         # Get LLM response
-        response = self._call_llm()
+        response = self.intent_detector_call()
 
         # Check if the LLM wants to call a tool
         tool_call = self._parse_tool_call(response)
@@ -1054,8 +1164,8 @@ class JobAgent:
             memory.store_turn(self.session_id, role="assistant", text=response, user_id=self.user_id)
             return response
 
-    def _call_llm(self) -> str:
-        """Call the HuggingFace Llama model."""
+    def intent_detector_call(self) -> str:
+        """Intent detector and tool selector using LLM."""
         def _messages_to_prompt(msgs: list[dict]) -> str:
             # Simple, deterministic chat-to-text prompt for text-generation fallback.
             parts: list[str] = []
@@ -1091,10 +1201,12 @@ class JobAgent:
         messages: list[dict] = []
         try:
             ctx = memory.get_context(self.session_id, user_id=self.user_id)
-            messages = self.conversation_history + [
+            # Only use last 10 turns for context awareness (limit token usage)
+            recent_history = self.conversation_history[-20:] if len(self.conversation_history) > 20 else self.conversation_history
+            messages = recent_history + [
                 {
                     "role": "system",
-                    "content": f"Context packet (recent turns/artifacts/facts): {json.dumps(ctx)[:4000]}"
+                    "content": f"Context packet (recent turns/artifacts/facts): {json.dumps(ctx)[:2000]}"
                 }
             ]
             response = self.client.chat_completion(
